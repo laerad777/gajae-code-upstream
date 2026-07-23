@@ -14,6 +14,7 @@
 ### Changed
 
 - Raw tool-argument rejection hooks can now select from bounded, authority-controlled correction codes. Unknown or extension-supplied values retain the byte-for-byte generic rejection instead of reaching model-visible validation errors.
+- Raised the first-event stream timeout floor to five minutes for `alibaba-token-plan` models at both the OpenAI provider and outer lazy-stream watchdogs, while preserving caller and environment overrides and the existing inter-event idle timeout.
 
 ## [0.11.7] - 2026-07-22
 
