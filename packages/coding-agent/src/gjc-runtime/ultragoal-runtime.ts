@@ -5,6 +5,7 @@ import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "../skill-state/workflow-hud";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
+import { evaluateAggregateUltragoalCompletion } from "./ultragoal-completion";
 import {
 	CRITIC_GATE_HARD_STOP_EVENT,
 	CRITIC_GATE_OVERRIDE_EVENT,
@@ -1399,17 +1400,29 @@ export async function getUltragoalStatus(cwd: string, sessionId?: string | null)
 	for (const goal of plan.goals) counts[goal.status] += 1;
 	const currentGoal = plan.goals.find(goal => SCHEDULABLE_STATUSES.has(goal.status));
 	const overlap = openPipelineOverlap(plan);
+	const storiesTerminal =
+		plan.goals.length > 0 && plan.goals.every(goal => TERMINAL_OR_SKIPPED_STATUSES.has(goal.status));
+	let ledger: UltragoalLedgerEvent[] | undefined;
+	let aggregateVerified = false;
 	let status: UltragoalStatusSummary["status"] = "pending";
-	if (plan.goals.length > 0 && plan.goals.every(goal => TERMINAL_OR_SKIPPED_STATUSES.has(goal.status)))
-		status = "complete";
-	else if (counts.active > 0) status = "active";
+	if (storiesTerminal) {
+		if (plan.gjcGoalMode === "aggregate") {
+			ledger = await readUltragoalLedger(cwd, resolvedSessionId);
+			aggregateVerified = evaluateAggregateUltragoalCompletion(plan, ledger).state === "active_verified_complete";
+			status = aggregateVerified ? "complete" : "active";
+		} else {
+			status = "complete";
+		}
+	} else if (counts.active > 0) status = "active";
 	else if (counts.failed > 0) status = "failed";
 	else if (counts.blocked > 0 || counts.review_blocked > 0) status = "blocked";
-	const nudgeTarget = selectUltragoalNudgeTarget(plan, { currentGoalObjective: currentGoal?.objective });
+	const nudgeTarget = aggregateVerified
+		? null
+		: selectUltragoalNudgeTarget(plan, { currentGoalObjective: currentGoal?.objective });
 	let nudgeFields: Partial<UltragoalStatusSummary> = {};
 	if (nudgeTarget) {
 		const { budget } = await resolveUltragoalNudgeBudget(cwd);
-		const ledger = await readUltragoalLedger(cwd, resolvedSessionId);
+		ledger ??= await readUltragoalLedger(cwd, resolvedSessionId);
 		const nudgeCount = countUltragoalNudges(ledger, nudgeTarget.goalId);
 		nudgeFields = {
 			nudgeBudget: budget,
@@ -4732,11 +4745,11 @@ async function reconcileUltragoalState(cwd: string): Promise<void> {
 			goals_path: summary.paths.goalsPath,
 		};
 		if (summary.gjcObjective) payload.gjc_objective = summary.gjcObjective;
-		if (summary.nudgeBudget !== undefined) payload.nudge_budget = summary.nudgeBudget;
-		if (summary.nudgeCount !== undefined) payload.nudge_count = summary.nudgeCount;
-		if (summary.nudgeRemaining !== undefined) payload.nudge_remaining = summary.nudgeRemaining;
-		if (summary.nudgeGoalId !== undefined) payload.nudge_goal_id = summary.nudgeGoalId;
-		if (summary.nudgeTargetKind !== undefined) payload.nudge_target_kind = summary.nudgeTargetKind;
+		payload.nudge_budget = summary.nudgeBudget ?? null;
+		payload.nudge_count = summary.nudgeCount ?? null;
+		payload.nudge_remaining = summary.nudgeRemaining ?? null;
+		payload.nudge_goal_id = summary.nudgeGoalId ?? null;
+		payload.nudge_target_kind = summary.nudgeTargetKind ?? null;
 		if (summary.pipelineOverlap) payload.pipeline_overlap = summary.pipelineOverlap;
 		const ledgerText = await Bun.file(summary.paths.ledgerPath)
 			.text()

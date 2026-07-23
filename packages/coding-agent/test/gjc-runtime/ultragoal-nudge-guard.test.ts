@@ -47,6 +47,8 @@ async function setProjectBudget(cwd: string, budget: number): Promise<void> {
 const SINGLE_BRIEF = "Implement the story";
 const MULTI_BRIEF =
 	"Shared context.\n\n@goal: First story\nDo the first thing.\n\n@goal: Second story\nDo the second thing.";
+const THREE_STORY_BRIEF =
+	"Shared context.\n\n@goal: First story\nDo the first thing.\n\n@goal: Second story\nDo the second thing.\n\n@goal: Third story\nDo the third thing.";
 const DEFAULT_OBJECTIVE_GOAL = {
 	objective: DEFAULT_ULTRAGOAL_OBJECTIVE,
 	status: "active",
@@ -90,6 +92,35 @@ describe("ultragoal nudge guard", () => {
 		});
 
 		expect(diagnostic.state).toBe("unrelated_goal");
+	});
+	it("keeps terminal aggregate stories active and nudges the final receipt target until verified", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: THREE_STORY_BRIEF });
+		const initial = await getUltragoalStatus(cwd, TEST_SESSION_ID);
+		const plan = await readUltragoalPlan(cwd, TEST_SESSION_ID);
+		expect(plan).not.toBeNull();
+		const now = new Date().toISOString();
+		for (const goal of plan!.goals) {
+			goal.status = "complete";
+			goal.updatedAt = now;
+			goal.completedAt = now;
+			goal.evidence = "story work reported complete";
+			delete goal.completionVerification;
+		}
+		await Bun.write(initial.paths.goalsPath, `${JSON.stringify(plan, null, 2)}\n`);
+
+		for (let attempt = 1; attempt <= 7; attempt++)
+			await expect(assertUltragoalAskAllowed(cwd)).rejects.toThrow(
+				new RegExp(`try-harder nudge \\(${attempt}/10\\) for G003`),
+			);
+		const summary = await getUltragoalStatus(cwd, TEST_SESSION_ID);
+		expect(summary).toMatchObject({
+			status: "active",
+			nudgeGoalId: "G003",
+			nudgeTargetKind: "final_aggregate_receipt",
+			nudgeCount: 7,
+		});
 	});
 	// AC5: the escalating refusal text must never trip the bypass detector.
 	it("AC5: formatted nudge text never trips isUltragoalBypassPrompt for any surface", () => {

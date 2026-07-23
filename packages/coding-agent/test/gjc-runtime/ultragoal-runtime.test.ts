@@ -1296,6 +1296,12 @@ describe("native GJC ultragoal runtime", () => {
 		expect(validateCompletionReceipt({ plan, ledger, goal: plan.goals[0]!, receiptKind: "per-goal" }).state).toBe(
 			"active_verified_complete",
 		);
+		const malformedPlan = JSON.parse(await Bun.file(goalsPath).text()) as {
+			goals: Array<{ completionVerification?: { validationBatch?: Record<string, unknown> } }>;
+		};
+		delete malformedPlan.goals[2]?.completionVerification?.validationBatch?.memberIds;
+		await Bun.write(goalsPath, `${JSON.stringify(malformedPlan, null, 2)}\n`);
+		expect((await getUltragoalStatus(root)).status).toBe("active");
 		plan.goals[0]!.updatedAt = new Date(Date.now() + 1000).toISOString();
 		expect(
 			validateCompletionReceipt({ plan, ledger, goal: plan.goals[2]!, receiptKind: "final-aggregate" }).state,
@@ -4692,6 +4698,62 @@ describe("ultragoal @goal decomposition", () => {
 		const activeState = await readJsonFile(activeSnapshotPath(root, TEST_SESSION_ID));
 		expect(activeState.active).toBe(false);
 		expect(activeState.active_skills).toEqual([]);
+	});
+	it("keeps aggregate reconciliation active until the final receipt is fresh", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Reconcile final receipt status" });
+		await startNextUltragoalGoal({ cwd: root });
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "terminal aggregate receipt has verified evidence",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+
+		const goalsPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json");
+		const validPlan = await Bun.file(goalsPath).text();
+		const missingReceipt = JSON.parse(validPlan) as { goals: Array<{ completionVerification?: unknown }> };
+		delete missingReceipt.goals[0]?.completionVerification;
+		await Bun.write(goalsPath, `${JSON.stringify(missingReceipt, null, 2)}\n`);
+
+		await runNativeUltragoalCommand(["status"], root);
+		expect((await getUltragoalStatus(root)).status).toBe("active");
+		expect(await readJsonFile(sessionModeStatePath(root, TEST_SESSION_ID, "ultragoal"))).toMatchObject({
+			active: true,
+			status: "active",
+		});
+		expect(await readJsonFile(sessionModeStatePath(root, TEST_SESSION_ID, "ultragoal"))).toMatchObject({
+			nudge_goal_id: "G001",
+			nudge_target_kind: "final_aggregate_receipt",
+		});
+
+		await Bun.write(goalsPath, validPlan);
+		await runNativeUltragoalCommand(["status"], root);
+		const verified = await getUltragoalStatus(root);
+		expect(verified.status).toBe("complete");
+		expect(verified).not.toHaveProperty("nudgeGoalId");
+		expect(verified).not.toHaveProperty("nudgeTargetKind");
+		const verifiedModeState = await readJsonFile(sessionModeStatePath(root, TEST_SESSION_ID, "ultragoal"));
+		expect(verifiedModeState).toMatchObject({
+			active: false,
+			status: "complete",
+		});
+		expect(verifiedModeState).not.toHaveProperty("nudge_budget");
+		expect(verifiedModeState).not.toHaveProperty("nudge_count");
+		expect(verifiedModeState).not.toHaveProperty("nudge_remaining");
+		expect(verifiedModeState).not.toHaveProperty("nudge_goal_id");
+		expect(verifiedModeState).not.toHaveProperty("nudge_target_kind");
+
+		const staleReceipt = JSON.parse(validPlan) as { goals: Array<{ updatedAt: string }> };
+		staleReceipt.goals[0]!.updatedAt = new Date(Date.now() + 60_000).toISOString();
+		await Bun.write(goalsPath, `${JSON.stringify(staleReceipt, null, 2)}\n`);
+		await runNativeUltragoalCommand(["status"], root);
+		expect((await getUltragoalStatus(root)).status).toBe("active");
+		expect(await readJsonFile(sessionModeStatePath(root, TEST_SESSION_ID, "ultragoal"))).toMatchObject({
+			active: true,
+			status: "active",
+		});
 	});
 
 	it("reconciles missing durable plans with stale active mode-state", async () => {

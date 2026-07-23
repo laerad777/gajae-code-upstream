@@ -40,6 +40,14 @@ export interface UltragoalAskBlockDiagnostic {
 function requiredGoals(plan: UltragoalPlan): UltragoalGoal[] {
 	return plan.goals.filter(goal => goal.status !== "superseded");
 }
+function isStringRecord(value: unknown): value is Record<string, string> {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		!Array.isArray(value) &&
+		Object.values(value).every(item => typeof item === "string")
+	);
+}
 
 /**
  * Select the goal whose final-aggregate receipt should represent the run.
@@ -165,6 +173,21 @@ export function validateCompletionReceipt(input: {
 		}
 	}
 	if (receipt.validationBatch?.role === "batch-close") {
+		const batch = receipt.validationBatch;
+		if (
+			!Array.isArray(batch.memberIds) ||
+			!batch.memberIds.every(memberId => typeof memberId === "string") ||
+			typeof batch.finalGoalId !== "string" ||
+			!isStringRecord(batch.memberMetadataHashes) ||
+			!isStringRecord(batch.memberReceiptIds) ||
+			!isStringRecord(batch.memberChangeSetHashes)
+		) {
+			return {
+				state: "active_stale_receipt",
+				message: `Ultragoal ${input.goal.id} batch-close receipt metadata is malformed.`,
+				goalId: input.goal.id,
+			};
+		}
 		for (const memberId of receipt.validationBatch.memberIds) {
 			const member = input.plan.goals.find(goal => goal.id === memberId);
 			if (
@@ -281,4 +304,33 @@ export function validateCompletionReceipt(input: {
 		message: `Ultragoal ${input.goal.id} has a fresh ${input.receiptKind} receipt.`,
 		goalId: input.goal.id,
 	};
+}
+
+/** Receipt-aware aggregate completion used by status/reconciliation only. */
+export function evaluateAggregateUltragoalCompletion(
+	plan: UltragoalPlan,
+	ledger: readonly UltragoalLedgerEvent[],
+): UltragoalGuardDiagnostic {
+	const incomplete = requiredGoals(plan).filter(goal => goal.status !== "complete");
+	if (incomplete.length > 0) {
+		return {
+			state: "active_missing_final_receipt",
+			message: `Ultragoal still has incomplete required goals: ${incomplete.map(goal => goal.id).join(", ")}.`,
+			goalId: incomplete[0]?.id,
+		};
+	}
+	const finalReceiptGoal = findFinalAggregateReceiptGoal(plan, ledger);
+	if (!finalReceiptGoal) {
+		return {
+			state: "active_missing_final_receipt",
+			message: "Ultragoal aggregate completion is missing a final aggregate receipt.",
+			goalId: requiredGoals(plan).at(-1)?.id,
+		};
+	}
+	return validateCompletionReceipt({
+		plan,
+		ledger,
+		goal: finalReceiptGoal,
+		receiptKind: "final-aggregate",
+	});
 }
