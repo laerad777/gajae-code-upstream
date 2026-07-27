@@ -6,7 +6,6 @@ import {
 	groupModelProfilesForPresetLanding,
 	type ModelProfileDefinition,
 	mergeModelProfiles,
-	recommendModelProfileForProvider,
 	resolveProfileBindings,
 } from "@gajae-code/coding-agent/config/model-profiles";
 import { parseModelString } from "@gajae-code/coding-agent/config/model-resolver";
@@ -598,13 +597,13 @@ describe("built-in model profile catalog", () => {
 		).toBeDefined();
 	});
 
-	test("plain minimax provider does not appear in catalog or recommendations", () => {
+	test("plain minimax provider does not appear in the catalog", () => {
 		expect(JSON.stringify(BUILTIN_MODEL_PROFILES)).not.toContain("minimax/");
-		expect(recommendModelProfileForProvider("minimax", mergeModelProfiles())).toBeUndefined();
-		expect(recommendModelProfileForProvider("minimax-code", mergeModelProfiles())?.name).toBe("minimax-medium");
+		expect(mergeModelProfiles().has("minimax")).toBe(false);
+		expect(mergeModelProfiles().get("minimax-medium")?.requiredProviders).toEqual(["minimax-code"]);
 	});
 
-	test("presentation groups and provider recommendations are pure catalog helpers", () => {
+	test("presentation groups are pure catalog helpers", () => {
 		const profiles = mergeModelProfiles();
 		expect(getModelProfilePresentation("kimi-coding-plan-medium")).toEqual({
 			displayName: "Kimi Coding Plan Medium",
@@ -631,22 +630,6 @@ describe("built-in model profile catalog", () => {
 			"COMBOS",
 			"KIRO",
 		]);
-		expect(recommendModelProfileForProvider("openai-codex", profiles)?.name).toBe("codex-medium");
-		expect(recommendModelProfileForProvider("anthropic", profiles)?.name).toBe("claude-opus");
-		expect(recommendModelProfileForProvider("opencode-go", profiles)?.name).toBe("opencodego");
-		expect(recommendModelProfileForProvider("zai", profiles)?.name).toBe("glm-medium");
-		expect(recommendModelProfileForProvider("kimi-code", profiles)?.name).toBe("kimi-coding-plan-medium");
-		expect(recommendModelProfileForProvider("xiaomi", profiles)?.name).toBe("mimo-medium");
-		expect(recommendModelProfileForProvider("xiaomi-token-plan-sgp", profiles)?.name).toBe("mimo-medium");
-		expect(recommendModelProfileForProvider("xiaomi-token-plan-ams", profiles)?.name).toBe("mimo-medium");
-		expect(recommendModelProfileForProvider("xiaomi-token-plan-cn", profiles)?.name).toBe("mimo-medium");
-		expect(recommendModelProfileForProvider("xai", profiles)?.name).toBe("grok-medium");
-		expect(recommendModelProfileForProvider("grok-build", profiles)?.name).toBe("grok-build-pro");
-		expect(recommendModelProfileForProvider("cursor", profiles)?.name).toBe("cursor-medium");
-		expect(recommendModelProfileForProvider("alibaba-token-plan", profiles)?.name).toBe(
-			"alibaba-token-plan-balanced",
-		);
-		expect(recommendModelProfileForProvider("kiro", profiles)?.name).toBe("kiro-opus");
 		expect(getModelProfilePresentation("alibaba-token-plan-balanced")).toEqual({
 			displayName: "Balanced",
 			providerGroup: "ALIBABA TOKEN PLAN",

@@ -390,24 +390,6 @@ const PROFILE_GROUP_ORDER = [
 	"KIRO",
 ];
 
-const PROFILE_RECOMMENDATIONS: Record<string, string> = {
-	"openai-codex": "codex-medium",
-	anthropic: "claude-opus",
-	"opencode-go": "opencodego",
-	zai: "glm-medium",
-	"kimi-code": "kimi-coding-plan-medium",
-	xiaomi: "mimo-medium",
-	"xiaomi-token-plan-sgp": "mimo-medium",
-	"xiaomi-token-plan-ams": "mimo-medium",
-	"xiaomi-token-plan-cn": "mimo-medium",
-	xai: "grok-medium",
-	"grok-build": "grok-build-pro",
-	cursor: "cursor-medium",
-	"minimax-code": "minimax-medium",
-	"alibaba-token-plan": "alibaba-token-plan-balanced",
-	kiro: "kiro-opus",
-};
-
 export function getModelProfilePresentation(
 	profile: string | Pick<ModelProfileDefinition, "name" | "displayName">,
 ): ModelProfilePresentation {
@@ -441,14 +423,6 @@ export function groupModelProfilesForPresetLanding(
 		else entries.sort((a, b) => a.name.localeCompare(b.name));
 	}
 	return groups;
-}
-
-export function recommendModelProfileForProvider(
-	providerId: string,
-	profiles: ReadonlyMap<string, ModelProfileDefinition>,
-): ModelProfileDefinition | undefined {
-	const recommended = PROFILE_RECOMMENDATIONS[providerId];
-	return recommended ? profiles.get(recommended) : undefined;
 }
 
 export function mergeModelProfiles(userProfiles?: ModelsConfig["profiles"]): Map<string, ModelProfileDefinition> {

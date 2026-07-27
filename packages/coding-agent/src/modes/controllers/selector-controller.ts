@@ -14,7 +14,7 @@ import {
 	materializeModelProfileForDeletion,
 	restoreMaterializedModelProfileForDeletion,
 } from "../../config/model-profile-activation";
-import { formatModelProfileDisplayLabel, recommendModelProfileForProvider } from "../../config/model-profiles";
+import { formatModelProfileDisplayLabel } from "../../config/model-profiles";
 import { GJC_MODEL_ASSIGNMENT_TARGETS, type GjcModelAssignmentTargetId } from "../../config/model-registry";
 import { formatModelSelectorValue } from "../../config/model-resolver";
 import { selectorHead } from "../../config/model-selector-value";
@@ -2374,34 +2374,6 @@ export class SelectorController {
 		await this.showSessionSelector();
 	}
 
-	async #handlePostLoginModelProfileRecommendation(providerId: string): Promise<void> {
-		const recommendedProfile = recommendModelProfileForProvider(
-			providerId,
-			this.ctx.session.modelRegistry.getModelProfiles(),
-		);
-		if (!recommendedProfile) {
-			return;
-		}
-
-		const activeProfile = this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default");
-		if (activeProfile) {
-			this.ctx.showStatus(`Preset ${recommendedProfile.name} is available in /model.`);
-			return;
-		}
-
-		const confirmed = await this.ctx.showHookConfirm(`Apply ${recommendedProfile.name} now?`, "");
-		if (!confirmed) {
-			return;
-		}
-
-		await activateModelProfile({
-			session: this.ctx.session,
-			modelRegistry: this.ctx.session.modelRegistry,
-			settings: this.ctx.settings,
-			profileName: recommendedProfile.name,
-		});
-	}
-
 	async #handleOAuthLogin(providerId: string, kiroMethod?: KiroLoginMethod): Promise<void> {
 		this.ctx.showStatus(`Logging in to ${providerId}…`);
 		const manualInput = this.ctx.oauthManualInput;
@@ -2459,7 +2431,6 @@ export class SelectorController {
 				new Text(theme.fg("success", `${theme.status.success} Successfully logged in to ${providerId}`), 1, 0),
 			);
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", `Credentials saved to ${getAgentDbPath()}`), 1, 0));
-			await this.#handlePostLoginModelProfileRecommendation(providerId);
 			this.ctx.ui.requestRender();
 		} catch (error: unknown) {
 			this.ctx.showError(`Login failed: ${error instanceof Error ? error.message : String(error)}`);
