@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { Effort } from "../src/model-thinking";
 import {
 	buildKiroRequest,
 	KIRO_BUILDER_ID_PROFILE_ARN,
@@ -120,6 +121,24 @@ describe("Kiro provider", () => {
 		const ids = assistantHistory.assistantResponseMessage.toolUses?.map(tool => tool.toolUseId) ?? [];
 		expect(ids.every(id => /^[A-Za-z0-9_-]{1,64}$/.test(id))).toBe(true);
 		expect(new Set(ids).size).toBe(ids.length);
+	});
+	test("maps profile effort to Kiro adaptive reasoning fields", () => {
+		const context = {
+			messages: [{ role: "user" as const, content: "Think", timestamp: 1 }],
+		};
+		const reasoningModel = { ...model, reasoning: true };
+		expect(
+			buildKiroRequest(reasoningModel, context, KIRO_BUILDER_ID_PROFILE_ARN, Effort.XHigh)
+				.additionalModelRequestFields,
+		).toEqual({
+			thinking: { type: "adaptive", display: "summarized" },
+			reasoning: { effort: "xhigh" },
+		});
+		expect(
+			buildKiroRequest(reasoningModel, context, KIRO_BUILDER_ID_PROFILE_ARN).additionalModelRequestFields,
+		).toEqual({
+			thinking: { type: "disabled" },
+		});
 	});
 
 	test("repairs orphan tool calls before Kiro serialization", () => {

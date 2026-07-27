@@ -3,7 +3,7 @@ import { KIRO_RUNTIME_URL, parseKiroAccessContext } from "../providers/kiro";
 import type { Model } from "../types";
 import { fetchKiroModels } from "../utils/discovery/kiro";
 
-const KIRO_STATIC_SEED: readonly Model<"kiro-streaming">[] = [
+export const KIRO_STATIC_SEED: readonly Model<"kiro-streaming">[] = [
 	{
 		id: "claude-opus-5",
 		name: "claude-opus-5",
@@ -19,6 +19,42 @@ const KIRO_STATIC_SEED: readonly Model<"kiro-streaming">[] = [
 	{
 		id: "claude-sonnet-5",
 		name: "claude-sonnet-5",
+		api: "kiro-streaming",
+		provider: "kiro",
+		baseUrl: KIRO_RUNTIME_URL,
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_000_000,
+		maxTokens: 64_000,
+	},
+	{
+		id: "gpt-5.6-sol",
+		name: "gpt-5.6-sol",
+		api: "kiro-streaming",
+		provider: "kiro",
+		baseUrl: KIRO_RUNTIME_URL,
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_000_000,
+		maxTokens: 64_000,
+	},
+	{
+		id: "gpt-5.6-terra",
+		name: "gpt-5.6-terra",
+		api: "kiro-streaming",
+		provider: "kiro",
+		baseUrl: KIRO_RUNTIME_URL,
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_000_000,
+		maxTokens: 64_000,
+	},
+	{
+		id: "gpt-5.6-luna",
+		name: "gpt-5.6-luna",
 		api: "kiro-streaming",
 		provider: "kiro",
 		baseUrl: KIRO_RUNTIME_URL,

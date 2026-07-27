@@ -9,9 +9,9 @@ import type {
 	ImageContent,
 	Message,
 	Model,
+	SimpleStreamOptions,
 	StopReason,
 	StreamFunction,
-	StreamOptions,
 	TextContent,
 	Tool,
 	ToolCall,
@@ -91,7 +91,7 @@ export async function resolveKiroProfileArn(accessToken: string, fetcher: KiroFe
 	return KIRO_BUILDER_ID_PROFILE_ARN;
 }
 
-export interface KiroOptions extends StreamOptions {
+export interface KiroOptions extends SimpleStreamOptions {
 	profileArn?: string;
 }
 
@@ -270,7 +270,12 @@ function convertHistory(
 	return history;
 }
 
-export function buildKiroRequest(model: Model<"kiro-streaming">, context: Context, profileArn: string): KiroRequest {
+export function buildKiroRequest(
+	model: Model<"kiro-streaming">,
+	context: Context,
+	profileArn: string,
+	reasoning?: KiroOptions["reasoning"],
+): KiroRequest {
 	const tools = convertTools(context.tools);
 	const messages = transformMessages(context.messages, model);
 	let current: KiroUserInputMessage;
@@ -306,9 +311,12 @@ export function buildKiroRequest(model: Model<"kiro-streaming">, context: Contex
 		profileArn,
 	};
 	if (model.reasoning) {
-		request.additionalModelRequestFields = {
-			thinking: { type: "adaptive", display: "summarized" },
-		};
+		request.additionalModelRequestFields = reasoning
+			? {
+					thinking: { type: "adaptive", display: "summarized" },
+					reasoning: { effort: reasoning },
+				}
+			: { thinking: { type: "disabled" } };
 	}
 	return request;
 }
@@ -365,7 +373,7 @@ export const streamKiro: StreamFunction<"kiro-streaming"> = (
 			if (!options.apiKey) throw new Error("Kiro access token is required");
 			const access = parseKiroAccessContext(options.apiKey);
 			const profileArn = options.profileArn ?? access.profileArn ?? (await resolveKiroProfileArn(access.token));
-			const request = buildKiroRequest(model, context, profileArn);
+			const request = buildKiroRequest(model, context, profileArn, options.reasoning);
 			options.onPayload?.(request);
 			const response = await fetchWithRetry(model.baseUrl || KIRO_RUNTIME_URL, {
 				method: "POST",
