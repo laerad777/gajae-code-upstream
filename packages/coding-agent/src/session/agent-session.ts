@@ -13306,18 +13306,24 @@ export class AgentSession {
 	 * i.e. retry a bounded number of times (capped at retry.maxRetries) and then
 	 * surface, instead of joining the unbounded transient-retry class.
 	 *
-	 * Targets the ollama-chat API, which is exclusively ollama-cloud (local
-	 * Ollama uses the openai-responses API). That remote, queued backend can
-	 * stall before its first token even for tiny prompts; an unbounded
-	 * continuation retry re-issues the full request on every attempt and can
-	 * silently spike upstream usage (#713). First-party providers keep their
-	 * existing unbounded first-event-timeout retry behavior.
+	 * Targets remote, billable backends whose pre-first-token stall can repeat
+	 * indefinitely:
+	 * - `ollama-chat` is exclusively ollama-cloud (local Ollama uses the
+	 *   openai-responses API); its queued backend can stall before the first
+	 *   token even for tiny prompts (#713).
+	 * - `kiro-streaming` re-issues the full CodeWhisperer conversation state on
+	 *   every attempt against a metered Kiro entitlement, so an unbounded loop
+	 *   silently burns quota.
+	 *
+	 * First-party providers keep their existing unbounded first-event-timeout
+	 * retry behavior.
 	 */
 	#shouldFailClosedOnFirstEventTimeout(message: AssistantMessage): boolean {
 		// Prefer the active model's API (the model that produced the error);
 		// the errored message's API is a fallback for the rare case where the
 		// session model has already moved on.
-		return this.model?.api === "ollama-chat" || message.api === "ollama-chat";
+		const api = this.model?.api ?? message.api;
+		return api === "ollama-chat" || api === "kiro-streaming";
 	}
 
 	#isTerminalErrorMessage(errorMessage: string): boolean {

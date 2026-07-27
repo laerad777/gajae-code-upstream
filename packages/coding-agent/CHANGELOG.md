@@ -41,6 +41,7 @@
 
 ### Added
 
+- Added native Kiro provider support: personal login selection (AWS Builder ID, Google, GitHub), account-specific profile/model discovery, streaming inference with tool-call round trips, and the `kiro-pro` built-in model profile.
 - Added cross-platform memory-pressure observability with effective host/cgroup limits, configurable GC and restart advisory thresholds, typed Linux process probes, and a Windows Job Object native probe; unsupported lifecycle actions remain advisory-only.
 - Added versioned memory-guard checkpoints with strict transcript/blob validation and fail-closed cross-process writer/TTY ownership claims for future graceful restart activation.
 - Ralplan consensus planning now enforces a finite planner/revision iteration budget at the native write path (default 5, configurable via `gjc.ralplan.maxIterations`). Opening another planner/revision pass past the cap fails closed with exit code 3 and an operator-visible `PLANNING-STUCK` marker instead of silent unbounded re-review; `final`/post-interview escalation remains allowed without auto-implementation. The cap also floors against on-disk `stage-*-{planner,revision}.md` artifacts so a wiped, truncated, or malformed `index.jsonl` cannot fail open after prior openers (#3165).

@@ -106,6 +106,13 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "anthropic/claude-opus-5:high",
 		architect: "anthropic/claude-opus-5:xhigh",
 	}),
+	profile("kiro-pro", ["kiro"], {
+		default: "kiro/claude-opus-5",
+		executor: "kiro/claude-sonnet-5",
+		planner: "kiro/claude-opus-5",
+		critic: "kiro/claude-opus-5",
+		architect: "kiro/claude-opus-5",
+	}),
 	profile("claude-fable", ["anthropic"], {
 		default: "anthropic/claude-fable-5:xhigh",
 		executor: "anthropic/claude-sonnet-5",
@@ -330,6 +337,7 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	opencodego: { displayName: "OpenCodeGo", providerGroup: "OPENCODEGO" },
 	"claude-opus": { displayName: "Claude Opus", providerGroup: "CLAUDE" },
 	"claude-fable": { displayName: "Claude Fable", providerGroup: "CLAUDE" },
+	"kiro-pro": { displayName: "Kiro Pro", providerGroup: "KIRO" },
 	"glm-eco": { displayName: "GLM Eco", providerGroup: "GLM" },
 	"glm-medium": { displayName: "GLM Medium", providerGroup: "GLM" },
 	"glm-pro": { displayName: "GLM Pro", providerGroup: "GLM" },
@@ -371,6 +379,7 @@ const PROFILE_GROUP_ORDER = [
 	"MINIMAX",
 	"ALIBABA TOKEN PLAN",
 	"COMBOS",
+	"KIRO",
 ];
 
 const PROFILE_RECOMMENDATIONS: Record<string, string> = {
@@ -388,6 +397,7 @@ const PROFILE_RECOMMENDATIONS: Record<string, string> = {
 	cursor: "cursor-medium",
 	"minimax-code": "minimax-medium",
 	"alibaba-token-plan": "alibaba-token-plan-balanced",
+	kiro: "kiro-pro",
 };
 
 export function getModelProfilePresentation(
