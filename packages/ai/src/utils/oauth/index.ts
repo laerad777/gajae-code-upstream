@@ -1,6 +1,8 @@
 // ============================================================================
 // High-level API
 // ============================================================================
+
+import { refreshKiroSocialToken, refreshKiroToken } from "./kiro";
 import type {
 	OAuthCredentials,
 	OAuthProvider,
@@ -43,6 +45,11 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 	{
 		id: "kilo",
 		name: "Kilo Gateway",
+		available: true,
+	},
+	{
+		id: "kiro",
+		name: "Kiro",
 		available: true,
 	},
 	{
@@ -313,6 +320,13 @@ export async function refreshOAuthToken(
 			newCredentials = await refreshAnthropicToken(credentials.refresh);
 			break;
 		}
+		case "kiro": {
+			newCredentials =
+				credentials.kiroMethod === "google" || credentials.kiroMethod === "github"
+					? await refreshKiroSocialToken(credentials, credentials.kiroMethod)
+					: await refreshKiroToken(credentials);
+			break;
+		}
 		case "github-copilot": {
 			const { refreshGitHubCopilotToken } = await import("./github-copilot");
 			newCredentials = await refreshGitHubCopilotToken(credentials.refresh, credentials.enterpriseUrl);
@@ -476,7 +490,10 @@ export async function getOAuthApiKey(
 	}
 	// For providers that need request-time credential metadata, return JSON.
 	const needsStructuredApiKey =
-		provider === "github-copilot" || provider === "google-gemini-cli" || provider === "google-antigravity";
+		provider === "github-copilot" ||
+		provider === "google-gemini-cli" ||
+		provider === "google-antigravity" ||
+		provider === "kiro";
 	const apiKey = needsStructuredApiKey
 		? JSON.stringify({
 				token: creds.access,
@@ -486,6 +503,8 @@ export async function getOAuthApiKey(
 				expiresAt: creds.expires,
 				email: creds.email,
 				accountId: creds.accountId,
+				kiroMethod: creds.kiroMethod,
+				kiroProfileArn: creds.kiroProfileArn,
 			})
 		: creds.access;
 	return { newCredentials: creds, apiKey };

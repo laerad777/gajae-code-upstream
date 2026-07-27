@@ -187,6 +187,7 @@ describe("resolveLazyStreamFirstEventFallbackMs", () => {
 	it("returns 300s for slow-first-event providers without a configured fallback", () => {
 		expect(resolveLazyStreamFirstEventFallbackMs("alibaba-token-plan")).toBe(300_000);
 		expect(resolveLazyStreamFirstEventFallbackMs("kimi-code")).toBe(300_000);
+		expect(resolveLazyStreamFirstEventFallbackMs("kiro")).toBe(300_000);
 	});
 	it("returns undefined for unrelated providers", () => {
 		expect(resolveLazyStreamFirstEventFallbackMs("openai")).toBeUndefined();
@@ -195,6 +196,7 @@ describe("resolveLazyStreamFirstEventFallbackMs", () => {
 	it("prefers a configured wrapper fallback over the provider default", () => {
 		expect(resolveLazyStreamFirstEventFallbackMs("alibaba-token-plan", 42_000)).toBe(42_000);
 		expect(resolveLazyStreamFirstEventFallbackMs("kimi-code", 42_000)).toBe(42_000);
+		expect(resolveLazyStreamFirstEventFallbackMs("kiro", 42_000)).toBe(42_000);
 		expect(resolveLazyStreamFirstEventFallbackMs("google-gemini-cli", 300_000)).toBe(300_000);
 	});
 });

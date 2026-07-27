@@ -34,6 +34,7 @@ import { zaiUsageProvider } from "./usage/zai";
 import { getOAuthApiKey, getOAuthProvider, refreshOAuthToken, resolveOAuthStorageProvider } from "./utils/oauth";
 import { loginDeepInfra } from "./utils/oauth/deepinfra";
 import { loginDeepSeek } from "./utils/oauth/deepseek";
+import { loginKiro } from "./utils/oauth/kiro";
 import { loginOpenAICodexDevice } from "./utils/oauth/openai-codex";
 import type { OAuthController, OAuthCredentials, OAuthProvider, OAuthProviderId } from "./utils/oauth/types";
 
@@ -1710,6 +1711,16 @@ export class AuthStorage {
 					onPrompt: ctrl.onPrompt,
 					onProgress: ctrl.onProgress,
 					signal: ctrl.signal,
+				});
+				break;
+			}
+			case "kiro": {
+				credentials = await loginKiro({
+					onAuth: (url, instructions) => ctrl.onAuth({ url, instructions }),
+					onPrompt: ctrl.onPrompt,
+					onProgress: ctrl.onProgress,
+					signal: ctrl.signal,
+					method: ctrl.kiroMethod,
 				});
 				break;
 			}
@@ -3758,6 +3769,8 @@ export class AuthStorage {
 				email: refreshed.email ?? target.credential.email,
 				projectId: refreshed.projectId ?? target.credential.projectId,
 				enterpriseUrl: refreshed.enterpriseUrl ?? target.credential.enterpriseUrl,
+				kiroMethod: refreshed.kiroMethod ?? target.credential.kiroMethod,
+				kiroProfileArn: refreshed.kiroProfileArn ?? target.credential.kiroProfileArn,
 				mcpBinding: target.credential.mcpBinding,
 			};
 			this.#replaceCredentialAt(provider, index, updated);

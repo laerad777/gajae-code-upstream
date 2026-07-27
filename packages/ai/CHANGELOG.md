@@ -1,8 +1,9 @@
 # Changelog
 
 ## [Unreleased]
-
 ### Added
+
+- Added native Kiro authentication, entitlement-aware profile/model discovery, and AWS event-stream inference with tool-call round trips. Profile resolution now follows the authenticated account, including account-specific Pro+ catalogs, rather than assuming the Builder ID profile for every credential.
 
 - Added first-class support for **BizRouter**, an OpenAI-compatible Korean enterprise LLM gateway. Registers the `bizrouter` provider descriptor, `/login` entry (API-key paste validated against `https://api.bizrouter.ai/v1/models`), `BIZROUTER_API_KEY` environment resolution, and bundled `models.json` seed models. Models are discovered dynamically from `GET /v1/models` (base URL `https://api.bizrouter.ai/v1`).
 ### Fixed
