@@ -54,7 +54,7 @@ describe("Kiro data-collection opt-out", () => {
 				profileRequests.push(
 					input instanceof Request ? new Request(input, init) : new Request(input.toString(), init),
 				);
-				return Response.json({ profiles: [{ arn: "arn:aws:codewhisperer:us-east-1:1:profile/P" }] });
+				return Response.json({ profiles: [{ arn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/P" }] });
 			};
 			await resolveKiroProfileArn("tok-optout-profile", profileFetcher);
 			expect(profileRequests[0]?.headers.get(KIRO_OPTOUT_HEADER)).toBe("true");
@@ -68,7 +68,7 @@ describe("Kiro data-collection opt-out", () => {
 			};
 			await fetchKiroModels({
 				accessToken: "tok-optout-discovery",
-				profileArn: "arn:aws:codewhisperer:us-east-1:1:profile/P",
+				profileArn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/P",
 				fetcher: discoveryFetcher,
 			});
 			expect(discoveryRequests[0]?.headers.get(KIRO_OPTOUT_HEADER)).toBe("true");
@@ -124,7 +124,7 @@ describe("Kiro image boundaries", () => {
 				},
 			],
 		};
-		expect(() => buildKiroRequest(model, context, "arn:aws:codewhisperer:us-east-1:1:profile/P")).toThrow(
+		expect(() => buildKiroRequest(model, context, "arn:aws:codewhisperer:us-east-1:123456789012:profile/P")).toThrow(
 			/image\/jpeg/,
 		);
 	});
@@ -140,7 +140,7 @@ describe("Kiro image boundaries", () => {
 				{ role: "user" as const, content: "second, now last", timestamp: 2 },
 			],
 		};
-		expect(() => buildKiroRequest(model, context, "arn:aws:codewhisperer:us-east-1:1:profile/P")).toThrow(
+		expect(() => buildKiroRequest(model, context, "arn:aws:codewhisperer:us-east-1:123456789012:profile/P")).toThrow(
 			/image\/webp/,
 		);
 	});
@@ -159,7 +159,7 @@ describe("Kiro image boundaries", () => {
 			});
 		const models = await fetchKiroModels({
 			accessToken: "tok",
-			profileArn: "arn:aws:codewhisperer:us-east-1:1:profile/P",
+			profileArn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/P",
 			fetcher,
 		});
 		expect(models?.[0]?.input).toEqual(["text"]);
@@ -172,7 +172,7 @@ describe("Kiro profile ARN cache", () => {
 		let calls = 0;
 		const fetcher = async (): Promise<Response> => {
 			calls += 1;
-			return Response.json({ profiles: [{ arn: `arn:aws:codewhisperer:us-east-1:1:profile/${calls}` }] });
+			return Response.json({ profiles: [{ arn: `arn:aws:codewhisperer:us-east-1:123456789012:profile/${calls}` }] });
 		};
 
 		for (let i = 0; i < 9; i++) {

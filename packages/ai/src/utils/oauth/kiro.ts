@@ -31,7 +31,7 @@
 import { Database } from "bun:sqlite";
 import { scheduler } from "node:timers/promises";
 import { getAgentDbPath } from "@gajae-code/utils";
-import { KIRO_BUILDER_ID_PROFILE_ARN } from "../../providers/kiro";
+import { isKiroProfileArn, KIRO_BUILDER_ID_PROFILE_ARN } from "../../providers/kiro";
 import { redactedHttpErrorSummary } from "../http-error-redaction";
 import type { KiroLoginMethod, OAuthCredentials } from "./types";
 
@@ -208,7 +208,6 @@ interface TokenResponse {
 	tokenType?: unknown;
 	expiresIn?: unknown;
 	error?: unknown;
-	error_description?: unknown;
 	interval?: unknown;
 }
 
@@ -220,6 +219,13 @@ function requestSignal(signal: AbortSignal | undefined): AbortSignal {
 function assertString(value: unknown, field: string): string {
 	if (typeof value !== "string" || value.length === 0) {
 		throw new Error(`Kiro token response missing ${field}`);
+	}
+	return value;
+}
+
+function assertKiroProfileArn(value: unknown, errorMessage: string): string {
+	if (!isKiroProfileArn(value)) {
+		throw new Error(errorMessage);
 	}
 	return value;
 }
@@ -282,8 +288,15 @@ async function postToken(
 		body: JSON.stringify({ clientId: registration.clientId, clientSecret: registration.clientSecret, ...body }),
 		signal: requestSignal(signal),
 	});
+	if (!response.ok) {
+		throw new Error(`Kiro token endpoint failed: ${redactedHttpErrorSummary(response)}`);
+	}
 	// Token endpoint returns 200 with an `error` body for pending/slow_down.
-	return (await response.json()) as TokenResponse;
+	try {
+		return (await response.json()) as TokenResponse;
+	} catch {
+		throw new Error("Kiro token endpoint returned invalid JSON");
+	}
 }
 
 async function pollForToken(
@@ -324,8 +337,7 @@ async function pollForToken(
 			intervalMs += 5000;
 			continue;
 		}
-		const description = typeof token.error_description === "string" ? token.error_description : "";
-		throw new Error(`Kiro device flow failed: ${error}${description ? `: ${description}` : ""}`);
+		throw new Error("Kiro device flow failed");
 	}
 
 	throw new Error("Kiro device flow timed out");
@@ -479,7 +491,7 @@ async function loginKiroSocial(method: "google" | "github", options: KiroLoginOp
 		const status = typeof poll.status === "string" ? poll.status : "";
 		if (typeof poll.accessToken === "string" && poll.accessToken) {
 			options.onProgress?.("Logged in to Kiro.");
-			const profileArn = assertString(poll.profileArn, "profileArn");
+			const profileArn = assertKiroProfileArn(poll.profileArn, "Kiro social login failed: invalid profile ARN");
 			return {
 				access: poll.accessToken,
 				refresh: assertString(poll.refreshToken, "refreshToken"),
@@ -491,7 +503,7 @@ async function loginKiroSocial(method: "google" | "github", options: KiroLoginOp
 			};
 		}
 		if (status === "authorization_pending") continue;
-		throw new Error(`Kiro social login failed: ${status || "unknown status"}`);
+		throw new Error("Kiro social login failed");
 	}
 
 	throw new Error("Kiro social device flow timed out");
@@ -511,6 +523,7 @@ interface SocialRefreshResponse {
 export async function refreshKiroSocialToken(
 	credentials: OAuthCredentials,
 	method: KiroLoginMethod,
+	signal?: AbortSignal,
 ): Promise<OAuthCredentials> {
 	if (method !== "google" && method !== "github") {
 		throw new Error(`refreshKiroSocialToken: invalid method ${method}`);
@@ -523,14 +536,16 @@ export async function refreshKiroSocialToken(
 			"accept-encoding": "gzip",
 		},
 		body: JSON.stringify({ refreshToken: credentials.refresh }),
-		signal: AbortSignal.timeout(TOKEN_REQUEST_TIMEOUT_MS),
+		signal: requestSignal(signal),
 	});
 	if (!response.ok) throw new Error(`Kiro social token refresh failed: ${redactedHttpErrorSummary(response)}`);
 	const payload = (await response.json()) as SocialRefreshResponse;
 	const access = assertString(payload.accessToken, "accessToken");
 	const refresh = typeof payload.refreshToken === "string" ? payload.refreshToken : credentials.refresh;
 	const refreshedProfileArn =
-		typeof payload.profileArn === "string" && payload.profileArn ? payload.profileArn : undefined;
+		typeof payload.profileArn === "string" && payload.profileArn
+			? assertKiroProfileArn(payload.profileArn, "Kiro social token refresh failed: invalid profile ARN")
+			: undefined;
 	if (credentials.kiroProfileArn && refreshedProfileArn && credentials.kiroProfileArn !== refreshedProfileArn) {
 		throw new Error("Kiro social token refresh failed: profile ARN changed");
 	}
@@ -552,19 +567,21 @@ export async function refreshKiroSocialToken(
  * registration. Requires that the registered client secret has not expired
  * (~90-day lifetime); otherwise the user must re-run `/login kiro`.
  */
-export async function refreshKiroToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+export async function refreshKiroToken(credentials: OAuthCredentials, signal?: AbortSignal): Promise<OAuthCredentials> {
 	const registration = await readRegistration();
 	if (!isRegistrationValid(registration)) {
 		throw new Error("Kiro client registration is missing or expired — run /login kiro again.");
 	}
-	const token = await postToken(registration, {
-		grantType: REFRESH_TOKEN_GRANT,
-		refreshToken: credentials.refresh,
-	});
+	const token = await postToken(
+		registration,
+		{
+			grantType: REFRESH_TOKEN_GRANT,
+			refreshToken: credentials.refresh,
+		},
+		signal,
+	);
 	if (typeof token.accessToken !== "string") {
-		const error = typeof token.error === "string" ? token.error : "unknown";
-		const description = typeof token.error_description === "string" ? token.error_description : "";
-		throw new Error(`Kiro token refresh failed: ${error}${description ? `: ${description}` : ""}`);
+		throw new Error("Kiro token refresh failed");
 	}
 	const expiresInToken = typeof token.expiresIn === "number" ? token.expiresIn : 28800;
 	// Preserve Kiro routing metadata from the incoming credential and backfill

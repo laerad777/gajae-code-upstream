@@ -36,6 +36,12 @@ export const KIRO_MANAGEMENT_URL = `https://management.${KIRO_REGION}.kiro.dev/`
 export const KIRO_BUILDER_ID_PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
 export const KIRO_ORIGIN = "KIRO_CLI";
 
+const KIRO_PROFILE_ARN_PATTERN = /^arn:aws:codewhisperer:us-east-1:\d{12}:profile\/[A-Za-z0-9_-]+$/;
+
+export function isKiroProfileArn(value: unknown): value is string {
+	return typeof value === "string" && KIRO_PROFILE_ARN_PATTERN.test(value);
+}
+
 /**
  * Header Kiro CLI uses to declare the user's upstream data-collection
  * preference. The value's polarity is undocumented (reverse-engineered from
@@ -189,14 +195,14 @@ async function resolveKiroProfileArnUncached(
 	if (Array.isArray(payload.profiles)) {
 		for (const value of payload.profiles) {
 			const profile = value as { arn?: unknown };
-			if (typeof profile.arn === "string" && profile.arn) {
+			if (isKiroProfileArn(profile.arn)) {
 				return cacheGeneration === kiroProfileArnCacheGeneration
 					? cacheProfileArn(cacheKey, profile.arn)
 					: profile.arn;
 			}
 		}
 	}
-	throw new Error("Kiro profile resolution failed: response contained no profile ARN");
+	throw new Error("Kiro profile resolution failed: response contained no valid profile ARN");
 }
 
 export interface KiroOptions extends SimpleStreamOptions {
@@ -566,7 +572,7 @@ export const streamKiro: StreamFunction<"kiro-streaming"> = (
 			const replacementPayload = await options.onPayload?.(request, model);
 			if (replacementPayload !== undefined) request = replacementPayload as KiroRequest;
 			const maxAttempts = resolveRetryBudget(options.requestMaxRetries, 2) + 1;
-			const response = await fetchWithRetry(model.baseUrl || KIRO_RUNTIME_URL, {
+			const response = await fetchWithRetry(KIRO_RUNTIME_URL, {
 				method: "POST",
 				headers: {
 					...options.headers,
@@ -613,8 +619,7 @@ export const streamKiro: StreamFunction<"kiro-streaming"> = (
 				const messageType = message.headers[":message-type"];
 				const eventType = message.headers[":event-type"];
 				if (messageType === "exception" || messageType === "error") {
-					const payload = parsePayload(message.payload);
-					throw new Error(String(payload.message ?? eventType ?? "Kiro stream error"));
+					throw new Error("Kiro stream error");
 				}
 				if (messageType !== "event") continue;
 				const payload = parsePayload(message.payload);

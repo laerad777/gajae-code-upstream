@@ -4,6 +4,7 @@ import { crc32 } from "../src/providers/aws-eventstream";
 import {
 	buildKiroRequest,
 	KIRO_ORIGIN,
+	KIRO_RUNTIME_URL,
 	type KiroRequest,
 	parseKiroAccessContext,
 	resetKiroProfileArnCache,
@@ -82,6 +83,37 @@ async function collectKiroEvents(frames: Uint8Array[]): Promise<AssistantMessage
 }
 
 describe("Kiro provider", () => {
+	test("pins OAuth bearer requests to the trusted Kiro runtime endpoint", async () => {
+		let requestedUrl = "";
+		const untrustedModel: Model<"kiro-streaming"> = {
+			...model,
+			baseUrl: "https://attacker.example/collect",
+		};
+		const stream = streamKiro(
+			untrustedModel,
+			{ messages: [] },
+			{
+				apiKey: "secret-oauth-token",
+				profileArn: BUILDER_ID_PROFILE_ARN,
+				fetch: async input => {
+					requestedUrl = String(input);
+					return new Response(
+						new ReadableStream<Uint8Array>({
+							start(controller) {
+								controller.close();
+							},
+						}),
+						{ status: 200 },
+					);
+				},
+			},
+		);
+
+		await stream.result();
+		expect(requestedUrl).toBe(KIRO_RUNTIME_URL);
+		expect(requestedUrl).not.toContain("attacker.example");
+	});
+
 	test("reuses one conversation id across provider-session turns", async () => {
 		const originalFetch = globalThis.fetch;
 		globalThis.fetch = (async () => new Response("{}", { status: 400 })) as unknown as typeof fetch;
@@ -342,6 +374,18 @@ describe("Kiro provider", () => {
 		expect(end.toolCall.incompleteArguments).toBe(true);
 	});
 
+	test("redacts mid-stream exception and error payloads before they reach the transcript", async () => {
+		const leaked = "account 123456789012 profile arn:aws:codewhisperer:us-east-1:123456789012:profile/SECRET";
+		for (const messageType of ["exception", "error"] as const) {
+			const events = await collectKiroEvents([kiroEventFrame("serviceException", { message: leaked }, messageType)]);
+
+			const failure = events.find(event => event.type === "error");
+			if (failure?.type !== "error") throw new Error("Expected error event");
+			expect(failure.error.errorMessage).toBe("Kiro stream error");
+			expect(failure.error.errorMessage).not.toContain(leaked);
+		}
+	});
+
 	test("keeps the first completed tool call when its id is repeated", async () => {
 		const events = await collectKiroEvents([
 			kiroEventFrame("toolUseEvent", { toolUseId: "tu-1", name: "echo", input: '{"a":1}', stop: true }),
@@ -441,6 +485,15 @@ describe("Kiro provider", () => {
 		expect(message).toBe("Kiro profile resolution failed: HTTP 400");
 		expect(message).not.toContain("123456789012");
 		expect(message).not.toContain("arn:aws:codewhisperer");
+	});
+
+	test("rejects malformed profile ARNs returned by profile discovery", async () => {
+		resetKiroProfileArnCache();
+		const fetcher = async (): Promise<Response> => Response.json({ profiles: [{ arn: "invalid-profile-value" }] });
+		const error = await resolveKiroProfileArn("profile-lookup-credential", fetcher).catch((cause: unknown) => cause);
+		const message = error instanceof Error ? error.message : String(error);
+		expect(message).toBe("Kiro profile resolution failed: response contained no valid profile ARN");
+		expect(message).not.toContain("invalid-profile-value");
 	});
 	test("builds native history, tool call, and tool result payloads", () => {
 		const request = buildKiroRequest(
@@ -707,21 +760,24 @@ describe("Kiro provider", () => {
 		const fetcher = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
 			const token = String(new Headers(init?.headers).get("authorization"));
 			targets.push(token);
-			return Response.json({ profiles: [{ arn: `arn:aws:codewhisperer:us-east-1:1:profile/${token}` }] });
+			const profileId = token.replace(/^Bearer /, "");
+			return Response.json({
+				profiles: [{ arn: `arn:aws:codewhisperer:us-east-1:123456789012:profile/${profileId}` }],
+			});
 		};
 
 		// Distinct tokens resolve independently: neither inherits the other's ARN.
-		expect(await resolveKiroProfileArn("token-a", fetcher)).toContain("Bearer token-a");
-		expect(await resolveKiroProfileArn("token-b", fetcher)).toContain("Bearer token-b");
+		expect(await resolveKiroProfileArn("token-a", fetcher)).toEndWith("/token-a");
+		expect(await resolveKiroProfileArn("token-b", fetcher)).toEndWith("/token-b");
 		expect(targets).toEqual(["Bearer token-a", "Bearer token-b"]);
 
 		// A repeat lookup for an already-resolved token performs no round trip.
-		expect(await resolveKiroProfileArn("token-a", fetcher)).toContain("Bearer token-a");
+		expect(await resolveKiroProfileArn("token-a", fetcher)).toEndWith("/token-a");
 		expect(targets).toHaveLength(2);
 
 		// Reset drops the memoized entries, so the next lookup resolves again.
 		resetKiroProfileArnCache();
-		expect(await resolveKiroProfileArn("token-a", fetcher)).toContain("Bearer token-a");
+		expect(await resolveKiroProfileArn("token-a", fetcher)).toEndWith("/token-a");
 		expect(targets).toEqual(["Bearer token-a", "Bearer token-b", "Bearer token-a"]);
 	});
 
@@ -731,7 +787,7 @@ describe("Kiro provider", () => {
 		const fetcher = async (): Promise<Response> => {
 			calls += 1;
 			await Bun.sleep(10);
-			return Response.json({ profiles: [{ arn: "arn:aws:codewhisperer:us-east-1:1:profile/ONE" }] });
+			return Response.json({ profiles: [{ arn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/ONE" }] });
 		};
 
 		const results = await Promise.all([
@@ -740,7 +796,7 @@ describe("Kiro provider", () => {
 			resolveKiroProfileArn("shared-token", fetcher),
 		]);
 		expect(calls).toBe(1);
-		expect(new Set(results)).toEqual(new Set(["arn:aws:codewhisperer:us-east-1:1:profile/ONE"]));
+		expect(new Set(results)).toEqual(new Set(["arn:aws:codewhisperer:us-east-1:123456789012:profile/ONE"]));
 	});
 
 	test("does not let an in-flight pre-reset ARN repopulate the cache", async () => {
@@ -752,13 +808,13 @@ describe("Kiro provider", () => {
 		const staleResolution = resolveKiroProfileArn("reset-token", async () => pendingResponse);
 
 		resetKiroProfileArnCache();
-		release(Response.json({ profiles: [{ arn: "arn:aws:codewhisperer:us-east-1:1:profile/STALE" }] }));
+		release(Response.json({ profiles: [{ arn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/STALE" }] }));
 		expect(await staleResolution).toEndWith("/STALE");
 
 		let freshCalls = 0;
 		const fresh = await resolveKiroProfileArn("reset-token", async () => {
 			freshCalls += 1;
-			return Response.json({ profiles: [{ arn: "arn:aws:codewhisperer:us-east-1:1:profile/FRESH" }] });
+			return Response.json({ profiles: [{ arn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/FRESH" }] });
 		});
 		expect(fresh).toEndWith("/FRESH");
 		expect(freshCalls).toBe(1);

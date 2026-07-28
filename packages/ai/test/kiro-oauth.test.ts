@@ -29,6 +29,23 @@ test("Kiro request credentials omit the unused refresh token", async () => {
 	expect(payload).not.toHaveProperty("refreshToken");
 });
 
+test("Kiro routing fields do not leak into other providers' structured credentials", async () => {
+	const result = await getOAuthApiKey("github-copilot", {
+		"github-copilot": {
+			access: "copilot-access",
+			refresh: "copilot-refresh",
+			expires: Date.now() + 60_000,
+			kiroMethod: "google",
+			kiroProfileArn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/POISON",
+		},
+	});
+	if (!result) throw new Error("expected a GitHub Copilot OAuth API key");
+	const payload = JSON.parse(result.apiKey) as Record<string, unknown>;
+	expect(payload.refreshToken).toBe("copilot-refresh");
+	expect(payload).not.toHaveProperty("kiroMethod");
+	expect(payload).not.toHaveProperty("kiroProfileArn");
+});
+
 let previousAgentDir: string | undefined;
 let previousPiConfigDir: string | undefined;
 let previousGjcConfigDir: string | undefined;
@@ -176,7 +193,7 @@ describe("Kiro device registration store", () => {
 			refresh: "old-refresh",
 			expires: 1,
 			kiroMethod: "builder-id",
-			kiroProfileArn: "arn:aws:codewhisperer:us-east-1:1:profile/P",
+			kiroProfileArn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/P",
 		});
 
 		// The registration round-tripped: its clientId/clientSecret reached the wire.
@@ -190,7 +207,7 @@ describe("Kiro device registration store", () => {
 		expect(refreshed.refresh).toBe("new-refresh");
 		expect(refreshed.expires).toBeGreaterThan(Date.now());
 		expect(refreshed.kiroMethod).toBe("builder-id");
-		expect(refreshed.kiroProfileArn).toBe("arn:aws:codewhisperer:us-east-1:1:profile/P");
+		expect(refreshed.kiroProfileArn).toBe("arn:aws:codewhisperer:us-east-1:123456789012:profile/P");
 	});
 
 	test("defaults kiroMethod to builder-id when the credential omits it", async () => {
@@ -376,6 +393,171 @@ describe("Kiro OAuth error redaction adoption", () => {
 		expectStatusOnly(error instanceof Error ? error.message : String(error), "Kiro social token refresh failed");
 		expect(response.bodyUsed).toBe(false);
 	});
+
+	test("redacts a Builder ID device-flow semantic error returned with HTTP 200", async () => {
+		await useTempAgentDir();
+		seedRegistration(validRegistration());
+		let call = 0;
+		stubFetch(async () => {
+			call += 1;
+			if (call === 1) {
+				return Response.json({
+					deviceCode: "device-code",
+					userCode: "USER-CODE",
+					verificationUriComplete: "https://example.invalid/verify",
+					interval: 0,
+					expiresIn: 60,
+				});
+			}
+			return Response.json({
+				error: "access_denied",
+				error_description: "account 123456789012 requestId 8f2c1d90-secret",
+			});
+		});
+
+		const error = await loginKiro({
+			onAuth: () => {},
+			onPrompt: async () => "",
+			method: "builder-id",
+		}).catch((cause: unknown) => cause);
+
+		expect(error instanceof Error ? error.message : String(error)).toBe("Kiro device flow failed");
+	});
+
+	test("redacts a Builder ID refresh semantic error returned with HTTP 200", async () => {
+		await useTempAgentDir();
+		seedRegistration(validRegistration());
+		stubFetch(async () =>
+			Response.json({
+				error: "invalid_grant",
+				error_description: "account 123456789012 requestId 8f2c1d90-secret",
+			}),
+		);
+
+		const error = await refreshKiroToken({
+			access: "old-access",
+			refresh: "old-refresh",
+			expires: 1,
+			kiroMethod: "builder-id",
+			kiroProfileArn: KIRO_BUILDER_ID_PROFILE_ARN,
+		}).catch((cause: unknown) => cause);
+
+		expect(error instanceof Error ? error.message : String(error)).toBe("Kiro token refresh failed");
+	});
+
+	test("returns a status-only error for a non-JSON Builder ID token failure", async () => {
+		await useTempAgentDir();
+		seedRegistration(validRegistration());
+		const response = new Response("<html>account 123456789012 requestId secret</html>", { status: 503 });
+		stubFetch(async () => response);
+
+		const error = await refreshKiroToken({
+			access: "old-access",
+			refresh: "old-refresh",
+			expires: 1,
+			kiroMethod: "builder-id",
+		}).catch((cause: unknown) => cause);
+		const message = error instanceof Error ? error.message : String(error);
+
+		expect(message).toBe("Kiro token endpoint failed: HTTP 503");
+		expect(response.bodyUsed).toBe(false);
+	});
+
+	test("redacts a malformed HTTP 200 Builder ID token response", async () => {
+		await useTempAgentDir();
+		seedRegistration(validRegistration());
+		stubFetch(async () => new Response("account 123456789012 requestId malformed-json-secret", { status: 200 }));
+
+		const error = await refreshKiroToken({
+			access: "old-access",
+			refresh: "old-refresh",
+			expires: 1,
+			kiroMethod: "builder-id",
+		}).catch((cause: unknown) => cause);
+		const message = error instanceof Error ? error.message : String(error);
+
+		expect(message).toBe("Kiro token endpoint returned invalid JSON");
+		expect(message).not.toContain("123456789012");
+		expect(message).not.toContain("malformed-json-secret");
+	});
+
+	test("rejects a malformed social profile ARN when no trusted ARN is stored", async () => {
+		stubFetch(async () =>
+			Response.json({
+				accessToken: "new-access",
+				refreshToken: "new-refresh",
+				expiresIn: 28_800,
+				profileArn: "not-an-arn",
+			}),
+		);
+
+		await expect(
+			refreshKiroSocialToken(
+				{ access: "old-access", refresh: "old-refresh", expires: 1, kiroMethod: "google" },
+				"google",
+			),
+		).rejects.toThrow("Kiro social token refresh failed: invalid profile ARN");
+	});
+
+	test("redacts an unexpected Kiro social polling status returned with HTTP 200", async () => {
+		await useTempAgentDir();
+		let call = 0;
+		stubFetch(async () => {
+			call += 1;
+			if (call === 1) {
+				return Response.json({
+					deviceCode: "device-code",
+					userCode: "USER-CODE",
+					verificationUriComplete: "https://example.invalid/verify",
+					intervalInMilliseconds: 0,
+					expiresInMilliseconds: 60_000,
+				});
+			}
+			return Response.json({ status: "account 123456789012 requestId 8f2c1d90-secret" });
+		});
+
+		const error = await loginKiro({
+			onAuth: () => {},
+			onPrompt: async () => "",
+			method: "google",
+		}).catch((cause: unknown) => cause);
+
+		expect(error instanceof Error ? error.message : String(error)).toBe("Kiro social login failed");
+	});
+
+	test("keeps polling through Builder ID pending and slow-down responses", async () => {
+		await useTempAgentDir();
+		seedRegistration(validRegistration());
+		let call = 0;
+		stubFetch(async () => {
+			call += 1;
+			switch (call) {
+				case 1:
+					return Response.json({
+						deviceCode: "device-code",
+						userCode: "USER-CODE",
+						verificationUriComplete: "https://example.invalid/verify",
+						interval: 0,
+						expiresIn: 60,
+					});
+				case 2:
+					return Response.json({ error: "authorization_pending" });
+				case 3:
+					return Response.json({ error: "slow_down" });
+				default:
+					return Response.json({ accessToken: "new-access", refreshToken: "new-refresh", expiresIn: 28_800 });
+			}
+		});
+
+		const credentials = await loginKiro({
+			onAuth: () => {},
+			onPrompt: async () => "",
+			method: "builder-id",
+		});
+
+		expect(credentials.access).toBe("new-access");
+		expect(call).toBe(4);
+	}, 10_000);
 });
 
 describe("Kiro social refresh resilience", () => {

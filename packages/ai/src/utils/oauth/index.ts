@@ -308,6 +308,7 @@ export function unregisterOAuthProviders(sourceId: string): void {
 export async function refreshOAuthToken(
 	provider: OAuthProvider,
 	credentials: OAuthCredentials,
+	signal?: AbortSignal,
 ): Promise<OAuthCredentials> {
 	if (!credentials) {
 		throw new Error(`No OAuth credentials found for ${provider}`);
@@ -323,8 +324,8 @@ export async function refreshOAuthToken(
 		case "kiro": {
 			newCredentials =
 				credentials.kiroMethod === "google" || credentials.kiroMethod === "github"
-					? await refreshKiroSocialToken(credentials, credentials.kiroMethod)
-					: await refreshKiroToken(credentials);
+					? await refreshKiroSocialToken(credentials, credentials.kiroMethod, signal)
+					: await refreshKiroToken(credentials, signal);
 			break;
 		}
 		case "github-copilot": {
@@ -503,8 +504,7 @@ export async function getOAuthApiKey(
 				expiresAt: creds.expires,
 				email: creds.email,
 				accountId: creds.accountId,
-				kiroMethod: creds.kiroMethod,
-				kiroProfileArn: creds.kiroProfileArn,
+				...(provider === "kiro" ? { kiroMethod: creds.kiroMethod, kiroProfileArn: creds.kiroProfileArn } : {}),
 			})
 		: creds.access;
 	return { newCredentials: creds, apiKey };
