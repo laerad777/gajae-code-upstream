@@ -2,12 +2,16 @@ import { describe, expect, test } from "bun:test";
 import { Effort } from "../src/model-thinking";
 import {
 	buildKiroRequest,
-	KIRO_BUILDER_ID_PROFILE_ARN,
 	KIRO_ORIGIN,
 	parseKiroAccessContext,
+	resetKiroProfileArnCache,
+	resolveKiroProfileArn,
 } from "../src/providers/kiro";
+import { resolveLazyStreamFirstEventFallbackMs } from "../src/providers/register-builtins";
 import type { AssistantMessage, Model } from "../src/types";
 import { fetchKiroModels } from "../src/utils/discovery/kiro";
+
+const BUILDER_ID_PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
 
 const model: Model<"kiro-streaming"> = {
 	id: "claude-haiku-4.5",
@@ -23,18 +27,38 @@ const model: Model<"kiro-streaming"> = {
 };
 
 describe("Kiro provider", () => {
-	test("parses credential-bound profile metadata", () => {
+	test("extracts the token and profile ARN from the structured Kiro credential payload", () => {
+		const profileArn = "arn:aws:codewhisperer:us-east-1:123456789012:profile/GOOGLE";
 		expect(
 			parseKiroAccessContext(
 				JSON.stringify({
 					token: "social-token",
-					kiroProfileArn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/GOOGLE",
+					kiroMethod: "google",
+					kiroProfileArn: profileArn,
 				}),
 			),
-		).toEqual({
-			token: "social-token",
-			profileArn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/GOOGLE",
-		});
+		).toEqual({ token: "social-token", profileArn });
+	});
+
+	test("treats a bare access token as the credential payload", () => {
+		expect(parseKiroAccessContext("plain-token")).toEqual({ token: "plain-token" });
+	});
+
+	test("omits the upstream message, account id, and ARN from resolution failures", async () => {
+		resetKiroProfileArnCache();
+		const fetcher = async (): Promise<Response> =>
+			new Response(
+				JSON.stringify({
+					__type: "com.amazon.codewhisperer#ValidationException",
+					message: "profile arn:aws:codewhisperer:us-east-1:123456789012:profile/SECRET is invalid",
+				}),
+				{ status: 400 },
+			);
+		const error = await resolveKiroProfileArn("token", fetcher).catch((cause: unknown) => cause);
+		const message = error instanceof Error ? error.message : String(error);
+		expect(message).toBe("Kiro profile resolution failed: HTTP 400");
+		expect(message).not.toContain("123456789012");
+		expect(message).not.toContain("arn:aws:codewhisperer");
 	});
 	test("builds native history, tool call, and tool result payloads", () => {
 		const request = buildKiroRequest(
@@ -88,10 +112,10 @@ describe("Kiro provider", () => {
 					},
 				],
 			},
-			KIRO_BUILDER_ID_PROFILE_ARN,
+			BUILDER_ID_PROFILE_ARN,
 		);
 
-		expect(request.profileArn).toBe(KIRO_BUILDER_ID_PROFILE_ARN);
+		expect(request.profileArn).toBe(BUILDER_ID_PROFILE_ARN);
 		expect(request.conversationState.history[1]).toEqual({
 			assistantResponseMessage: {
 				content: "",
@@ -122,21 +146,19 @@ describe("Kiro provider", () => {
 		expect(ids.every(id => /^[A-Za-z0-9_-]{1,64}$/.test(id))).toBe(true);
 		expect(new Set(ids).size).toBe(ids.length);
 	});
+
 	test("maps profile effort to Kiro adaptive reasoning fields", () => {
 		const context = {
 			messages: [{ role: "user" as const, content: "Think", timestamp: 1 }],
 		};
 		const reasoningModel = { ...model, reasoning: true };
 		expect(
-			buildKiroRequest(reasoningModel, context, KIRO_BUILDER_ID_PROFILE_ARN, Effort.XHigh)
-				.additionalModelRequestFields,
+			buildKiroRequest(reasoningModel, context, BUILDER_ID_PROFILE_ARN, Effort.XHigh).additionalModelRequestFields,
 		).toEqual({
 			thinking: { type: "adaptive", display: "summarized" },
 			reasoning: { effort: "xhigh" },
 		});
-		expect(
-			buildKiroRequest(reasoningModel, context, KIRO_BUILDER_ID_PROFILE_ARN).additionalModelRequestFields,
-		).toEqual({
+		expect(buildKiroRequest(reasoningModel, context, BUILDER_ID_PROFILE_ARN).additionalModelRequestFields).toEqual({
 			thinking: { type: "disabled" },
 		});
 	});
@@ -168,7 +190,7 @@ describe("Kiro provider", () => {
 					{ role: "user", content: "Continue", timestamp: 3 },
 				],
 			},
-			KIRO_BUILDER_ID_PROFILE_ARN,
+			BUILDER_ID_PROFILE_ARN,
 		);
 		const repaired = request.conversationState.history[2];
 		expect(repaired).toEqual({
@@ -208,7 +230,6 @@ describe("Kiro provider", () => {
 					{
 						modelId: "claude-haiku-4.5",
 						modelName: "Claude Haiku 4.5",
-						supportedInputTypes: ["TEXT", "IMAGE"],
 						tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 },
 					},
 				],
@@ -223,12 +244,57 @@ describe("Kiro provider", () => {
 				id: "claude-haiku-4.5",
 				api: "kiro-streaming",
 				provider: "kiro",
-				input: ["text", "image"],
 				contextWindow: 200_000,
 				maxTokens: 64_000,
 			}),
 		]);
 		const body = JSON.parse(await requests[1]!.text()) as Record<string, unknown>;
 		expect(body).toEqual({ origin: KIRO_ORIGIN, profileArn: resolvedProfileArn });
+	});
+	test("rejects image content instead of substituting a placeholder", () => {
+		const context = {
+			messages: [
+				{
+					role: "user" as const,
+					content: [
+						{ type: "text" as const, text: "look" },
+						{ type: "image" as const, data: "AAAA", mimeType: "image/png" },
+					],
+					timestamp: 1,
+				},
+			],
+		};
+		expect(() => buildKiroRequest(model, context, BUILDER_ID_PROFILE_ARN)).toThrow(
+			"Kiro transport does not support image input (received image/png)",
+		);
+	});
+
+	test("isolates memoized profile ARNs per access token and clears on reset", async () => {
+		resetKiroProfileArnCache();
+		const targets: string[] = [];
+		const fetcher = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			const token = String(new Headers(init?.headers).get("authorization"));
+			targets.push(token);
+			return Response.json({ profiles: [{ arn: `arn:aws:codewhisperer:us-east-1:1:profile/${token}` }] });
+		};
+
+		// Distinct tokens resolve independently: neither inherits the other's ARN.
+		expect(await resolveKiroProfileArn("token-a", fetcher)).toContain("Bearer token-a");
+		expect(await resolveKiroProfileArn("token-b", fetcher)).toContain("Bearer token-b");
+		expect(targets).toEqual(["Bearer token-a", "Bearer token-b"]);
+
+		// A repeat lookup for an already-resolved token performs no round trip.
+		expect(await resolveKiroProfileArn("token-a", fetcher)).toContain("Bearer token-a");
+		expect(targets).toHaveLength(2);
+
+		// Reset drops the memoized entries, so the next lookup resolves again.
+		resetKiroProfileArnCache();
+		expect(await resolveKiroProfileArn("token-a", fetcher)).toContain("Bearer token-a");
+		expect(targets).toEqual(["Bearer token-a", "Bearer token-b", "Bearer token-a"]);
+	});
+
+	test("exempts Kiro from the shared lazy-stream first-event floor", () => {
+		expect(resolveLazyStreamFirstEventFallbackMs("kiro")).toBe(300_000);
+		expect(resolveLazyStreamFirstEventFallbackMs("anthropic")).toBeUndefined();
 	});
 });

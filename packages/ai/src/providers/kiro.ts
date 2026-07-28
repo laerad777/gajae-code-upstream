@@ -1,6 +1,6 @@
 /** Kiro / Amazon Q streaming provider using the Builder ID bearer token. */
 import * as nodeCrypto from "node:crypto";
-import { extractHttpStatusFromError, fetchWithRetry } from "@gajae-code/utils";
+import { $env, extractHttpStatusFromError, fetchWithRetry } from "@gajae-code/utils";
 import { calculateCost } from "../models";
 import type {
 	Api,
@@ -19,6 +19,7 @@ import type {
 } from "../types";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
+import { redactedHttpErrorSummary } from "../utils/http-error-redaction";
 import { parseStreamingJson } from "../utils/json-parse";
 import { flattenToolRootCombinators, toolWireSchema } from "../utils/schema";
 import { decodeEventStream } from "./aws-eventstream";
@@ -27,8 +28,33 @@ import { transformMessages } from "./transform-messages";
 export const KIRO_REGION = "us-east-1";
 export const KIRO_RUNTIME_URL = `https://runtime.${KIRO_REGION}.kiro.dev/`;
 export const KIRO_MANAGEMENT_URL = `https://management.${KIRO_REGION}.kiro.dev/`;
-export const KIRO_BUILDER_ID_PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+// Builder ID login no longer persists a synthetic profile ARN. The value
+// kiro-cli 2.14.2 hardcodes is `arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX`
+// (reverse-engineered), but writing it into the credential would occupy the
+// authoritative slot with an unconfirmed value, so a stale constant would
+// silently 403 forever instead of falling back to `resolveKiroProfileArn`.
 export const KIRO_ORIGIN = "KIRO_CLI";
+
+/**
+ * Header Kiro CLI uses to declare the user's upstream data-collection
+ * preference. The value's polarity is undocumented (reverse-engineered from
+ * kiro-cli 2.14.2, which hardcodes `"false"`), so GJC never asserts a
+ * preference on the user's behalf: the header is omitted unless
+ * `GJC_KIRO_CODEWHISPERER_OPTOUT` explicitly supplies a value. Omission cannot
+ * misrepresent intent in either polarity; hardcoding a value can.
+ */
+export const KIRO_OPTOUT_HEADER = "x-amzn-codewhisperer-optout";
+
+/**
+ * Resolve the opt-out header pair, or an empty object when unset.
+ *
+ * Spread into a `headers` literal so an unset setting contributes no header at
+ * all rather than an empty-valued one.
+ */
+export function kiroOptoutHeader(): Record<string, string> {
+	const configured = $env.GJC_KIRO_CODEWHISPERER_OPTOUT?.trim();
+	return configured ? { [KIRO_OPTOUT_HEADER]: configured } : {};
+}
 
 const KIRO_STREAM_TARGET = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse";
 const KIRO_LIST_PROFILES_TARGET = "AmazonCodeWhispererService.ListAvailableProfiles";
@@ -59,36 +85,71 @@ interface KiroProfilesPayload {
 	profiles?: unknown;
 }
 
-export async function resolveKiroProfileArn(accessToken: string, fetcher: KiroFetcher = fetch): Promise<string> {
-	try {
-		const response = await fetcher(KIRO_MANAGEMENT_URL, {
-			method: "POST",
-			headers: {
-				Authorization: `Bearer ${accessToken}`,
-				"Content-Type": "application/x-amz-json-1.0",
-				"x-amz-target": KIRO_LIST_PROFILES_TARGET,
-				"User-Agent": KIRO_AWS_UA,
-				"x-amz-user-agent": KIRO_AWS_X_AMZ_UA,
-				"x-amzn-codewhisperer-optout": "false",
-				"amz-sdk-request": "attempt=1; max=3",
-				accept: "*/*",
-				"accept-encoding": "gzip",
-			},
-			body: "{}",
-		});
-		if (response.ok) {
-			const payload = (await response.json()) as KiroProfilesPayload;
-			if (Array.isArray(payload.profiles)) {
-				for (const value of payload.profiles) {
-					const profile = value as { arn?: unknown };
-					if (typeof profile.arn === "string" && profile.arn) return profile.arn;
-				}
-			}
-		}
-	} catch {
-		// Builder ID uses the standard profile even when profile listing is unavailable.
+/**
+ * Profile ARNs are stable per account and the endpoint is a control-plane
+ * round trip, so resolutions are memoized per access token. The credential
+ * itself does not persist the ARN: a Kiro access token is the only identity
+ * input available, and it can always re-derive the profile.
+ *
+ * Keyed by a SHA-256 digest of the token rather than the token itself, so the
+ * bearer secret never sits in a long-lived map (and therefore never lands in a
+ * heap or core dump). Digesting preserves the per-token isolation property — a
+ * refreshed or switched credential still never inherits another account's
+ * profile — and the map stays bounded so long sessions cannot grow it.
+ */
+const KIRO_PROFILE_ARN_CACHE = new Map<string, string>();
+const KIRO_PROFILE_ARN_CACHE_MAX = 8;
+
+function kiroProfileCacheKey(accessToken: string): string {
+	return nodeCrypto.createHash("sha256").update(accessToken).digest("hex");
+}
+
+function cacheProfileArn(cacheKey: string, profileArn: string): string {
+	if (KIRO_PROFILE_ARN_CACHE.size >= KIRO_PROFILE_ARN_CACHE_MAX) {
+		const oldest = KIRO_PROFILE_ARN_CACHE.keys().next();
+		if (!oldest.done) KIRO_PROFILE_ARN_CACHE.delete(oldest.value);
 	}
-	return KIRO_BUILDER_ID_PROFILE_ARN;
+	KIRO_PROFILE_ARN_CACHE.set(cacheKey, profileArn);
+	return profileArn;
+}
+
+/** Test seam: drop memoized profile resolutions. */
+export function resetKiroProfileArnCache(): void {
+	KIRO_PROFILE_ARN_CACHE.clear();
+}
+
+export async function resolveKiroProfileArn(accessToken: string, fetcher: KiroFetcher = fetch): Promise<string> {
+	const cacheKey = kiroProfileCacheKey(accessToken);
+	const cached = KIRO_PROFILE_ARN_CACHE.get(cacheKey);
+	if (cached) return cached;
+	const response = await fetcher(KIRO_MANAGEMENT_URL, {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${accessToken}`,
+			"Content-Type": "application/x-amz-json-1.0",
+			"x-amz-target": KIRO_LIST_PROFILES_TARGET,
+			"User-Agent": KIRO_AWS_UA,
+			"x-amz-user-agent": KIRO_AWS_X_AMZ_UA,
+			...kiroOptoutHeader(),
+			"amz-sdk-request": "attempt=1; max=3",
+			accept: "*/*",
+			"accept-encoding": "gzip",
+		},
+		body: "{}",
+	});
+	if (!response.ok) {
+		throw Object.assign(new Error(`Kiro profile resolution failed: ${redactedHttpErrorSummary(response)}`), {
+			status: response.status,
+		});
+	}
+	const payload = (await response.json()) as KiroProfilesPayload;
+	if (Array.isArray(payload.profiles)) {
+		for (const value of payload.profiles) {
+			const profile = value as { arn?: unknown };
+			if (typeof profile.arn === "string" && profile.arn) return cacheProfileArn(cacheKey, profile.arn);
+		}
+	}
+	throw new Error("Kiro profile resolution failed: response contained no profile ARN");
 }
 
 export interface KiroOptions extends SimpleStreamOptions {
@@ -174,13 +235,20 @@ export interface KiroRequest {
 
 type KiroBlock = (TextContent | ToolCall) & { partialJson?: string };
 
+/**
+ * Kiro's `userInputMessage` wire format carries text only — there is no image
+ * transport. Every Kiro model therefore advertises `input: ["text"]`, so an
+ * image block reaching here means capability filtering was bypassed. Throwing
+ * beats substituting a `[Image: ...]` placeholder, which silently returned a
+ * reply that never saw the attachment.
+ */
+function rejectImageContent(mimeType: string): never {
+	throw new Error(`Kiro transport does not support image input (received ${mimeType})`);
+}
+
 function stringifyContent(content: string | Array<TextContent | ImageContent>): string {
 	if (typeof content === "string") return content;
-	return content
-		.map(block =>
-			block.type === "text" ? block.text : `[Image: ${block.mimeType}; omitted from Kiro text transport]`,
-		)
-		.join("\n");
+	return content.map(block => (block.type === "text" ? block.text : rejectImageContent(block.mimeType))).join("\n");
 }
 
 function envState(): KiroUserInputMessage["userInputMessageContext"]["envState"] {
@@ -200,7 +268,21 @@ function convertTools(tools: Tool[] | undefined): KiroUserInputMessage["userInpu
 		},
 	}));
 }
+/**
+ * Kiro requires tool-use ids to be at most 64 chars of `[A-Za-z0-9_-]`
+ * (asserted by the existing wire tests). Ids Kiro itself issued already satisfy
+ * that shape, so they pass through verbatim — re-hashing them produced an id the
+ * server never issued and broke multi-turn tool replay. Foreign ids (e.g. the
+ * 100-char pipe-separated OpenAI Responses shape) still need normalizing, and
+ * SHA-256 yields a conforming, collision-resistant, deterministic id.
+ *
+ * The transform is a pure function of the id, so both callsites compute the same
+ * value independently and no cross-message map is needed.
+ */
+const KIRO_CONFORMING_TOOL_USE_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
 function kiroToolUseId(id: string): string {
+	if (KIRO_CONFORMING_TOOL_USE_ID.test(id)) return id;
 	return nodeCrypto.createHash("sha256").update(id).digest("hex");
 }
 
@@ -209,9 +291,7 @@ function convertToolResult(message: ToolResultMessage): KiroToolResult {
 		toolUseId: kiroToolUseId(message.toolCallId),
 		status: message.isError ? "error" : "success",
 		content: message.content.map(block =>
-			block.type === "text"
-				? { text: block.text }
-				: { text: `[Image: ${block.mimeType}; omitted from Kiro text transport]` },
+			block.type === "text" ? { text: block.text } : rejectImageContent(block.mimeType),
 		),
 	};
 }
@@ -381,7 +461,7 @@ export const streamKiro: StreamFunction<"kiro-streaming"> = (
 					Authorization: `Bearer ${access.token}`,
 					"Content-Type": "application/x-amz-json-1.0",
 					"x-amz-target": KIRO_STREAM_TARGET,
-					"x-amzn-codewhisperer-optout": "false",
+					...kiroOptoutHeader(),
 					"User-Agent": KIRO_STREAMING_UA,
 					"x-amz-user-agent": KIRO_STREAMING_X_AMZ_UA,
 					"amz-sdk-invocation-id": crypto.randomUUID(),
@@ -394,8 +474,7 @@ export const streamKiro: StreamFunction<"kiro-streaming"> = (
 				signal: options.signal,
 			});
 			if (!response.ok) {
-				const errorBody = await response.text();
-				throw Object.assign(new Error(`Kiro HTTP ${response.status}: ${errorBody}`), {
+				throw Object.assign(new Error(`Kiro ${redactedHttpErrorSummary(response)}`), {
 					status: response.status,
 				});
 			}
@@ -412,15 +491,6 @@ export const streamKiro: StreamFunction<"kiro-streaming"> = (
 				const payload = parsePayload(message.payload);
 				if (!started) {
 					started = true;
-					// Fire-and-forget SDK client telemetry call (mimics kiro-cli-chat 2.14.2).
-					try {
-						void fetch("https://client-telemetry.us-east-1.amazonaws.com/metric", {
-							method: "POST",
-							headers: { "User-Agent": KIRO_STREAMING_UA, "accept-encoding": "gzip" },
-						});
-					} catch {
-						// Telemetry is best-effort; ignore errors.
-					}
 					stream.push({ type: "start", partial: output });
 				}
 				switch (eventType) {

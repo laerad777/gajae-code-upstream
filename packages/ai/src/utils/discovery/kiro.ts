@@ -4,6 +4,7 @@ import {
 	KIRO_MANAGEMENT_URL,
 	KIRO_ORIGIN,
 	KIRO_RUNTIME_URL,
+	kiroOptoutHeader,
 	resolveKiroProfileArn,
 } from "../../providers/kiro";
 import type { Model } from "../../types";
@@ -14,7 +15,6 @@ interface KiroModelPayload {
 	modelId?: unknown;
 	modelName?: unknown;
 	description?: unknown;
-	supportedInputTypes?: unknown;
 	tokenLimits?: { maxInputTokens?: unknown; maxOutputTokens?: unknown };
 	additionalModelRequestFieldsSchema?: unknown;
 }
@@ -34,7 +34,7 @@ export interface KiroDiscoveryOptions {
 export async function fetchKiroModels(options: KiroDiscoveryOptions): Promise<Model<"kiro-streaming">[] | null> {
 	if (!options.accessToken.trim()) return null;
 	const fetcher = options.fetcher ?? fetch;
-	const profileArn = options.profileArn ?? (await resolveKiroProfileArn(options.accessToken, fetcher));
+	const profileArn = options.profileArn?.trim() || (await resolveKiroProfileArn(options.accessToken, fetcher));
 	const url = new URL(KIRO_MANAGEMENT_URL);
 	url.searchParams.set("origin", KIRO_ORIGIN);
 	url.searchParams.set("profileArn", profileArn);
@@ -45,7 +45,7 @@ export async function fetchKiroModels(options: KiroDiscoveryOptions): Promise<Mo
 				Authorization: `Bearer ${options.accessToken}`,
 				"Content-Type": "application/x-amz-json-1.0",
 				"x-amz-target": LIST_MODELS_TARGET,
-				"x-amzn-codewhisperer-optout": "false",
+				...kiroOptoutHeader(),
 				"User-Agent": KIRO_AWS_UA,
 				"x-amz-user-agent": KIRO_AWS_X_AMZ_UA,
 				"amz-sdk-request": "attempt=1; max=3",
@@ -67,10 +67,7 @@ export async function fetchKiroModels(options: KiroDiscoveryOptions): Promise<Mo
 			const schemaStr = JSON.stringify(model.additionalModelRequestFieldsSchema ?? {});
 			const hasThinking = schemaStr.includes('"thinking"');
 			const hasReasoning = schemaStr.includes('"reasoning"');
-			const supportsImage = Array.isArray(model.supportedInputTypes)
-				? model.supportedInputTypes.some((t: unknown) => t === "IMAGE")
-				: false;
-			const inputs = supportsImage ? (["text", "image"] as const) : (["text"] as const);
+			// Kiro's `userInputMessage` wire format is text-only.
 			return [
 				{
 					id: model.modelId,
@@ -79,7 +76,7 @@ export async function fetchKiroModels(options: KiroDiscoveryOptions): Promise<Mo
 					provider: "kiro" as const,
 					baseUrl: KIRO_RUNTIME_URL,
 					reasoning: (hasThinking || hasReasoning) as boolean,
-					input: [...inputs],
+					input: ["text"],
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 					contextWindow: maxInput,
 					maxTokens: maxOutput,
