@@ -1523,6 +1523,10 @@ function formatAccountLabel(limit: UsageLimit, report: UsageReport, index: numbe
 	if (email) return email;
 	const accountId = (report.metadata?.accountId as string | undefined) ?? limit.scope.accountId;
 	if (accountId) return accountId;
+	// Providers with opaque tokens (Kiro) carry no email/accountId, so they
+	// publish a derived, non-secret account label instead of nothing.
+	const account = report.metadata?.account as string | undefined;
+	if (account) return account;
 	return `account ${index + 1}`;
 }
 
@@ -1531,6 +1535,8 @@ function formatUnlimitedReportLabel(report: UsageReport, index: number): string 
 	if (email) return email;
 	const accountId = report.metadata?.accountId as string | undefined;
 	if (accountId) return accountId;
+	const account = report.metadata?.account as string | undefined;
+	if (account) return account;
 	return `account ${index + 1}`;
 }
 

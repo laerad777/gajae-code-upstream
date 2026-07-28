@@ -212,6 +212,87 @@ describe("Kiro usage provider", () => {
 		);
 	});
 
+	test("labels the account by login method so multi-account rows are distinguishable", async () => {
+		const ctx: UsageFetchContext = {
+			fetch: async (): Promise<Response> => Response.json({ usageBreakdownList: [usageBreakdown()] }),
+		};
+
+		const report = await kiroUsageProvider.fetchUsage(
+			usageParams({ expiresAt: Date.now() + 600_000, kiroMethod: "github" }),
+			ctx,
+		);
+
+		// Kiro credentials carry no email/accountId, so without this the renderer
+		// falls back to "account 1" for every credential.
+		expect(report?.metadata?.account).toBe("kiro github (PROPLUS)");
+		expect(report?.limits[0]?.scope.accountId).toBe("kiro github (PROPLUS)");
+	});
+
+	test("falls back to the profile suffix when the login method is absent", async () => {
+		const ctx: UsageFetchContext = {
+			fetch: async (): Promise<Response> => Response.json({ usageBreakdownList: [usageBreakdown()] }),
+		};
+
+		const report = await kiroUsageProvider.fetchUsage(
+			usageParams({ expiresAt: Date.now() + 600_000, kiroMethod: undefined }),
+			ctx,
+		);
+
+		expect(report?.metadata?.account).toBe("kiro (PROPLUS)");
+	});
+
+	test("keeps a server-supplied accountId ahead of the derived label", async () => {
+		const ctx: UsageFetchContext = {
+			fetch: async (): Promise<Response> => Response.json({ usageBreakdownList: [usageBreakdown()] }),
+		};
+
+		const report = await kiroUsageProvider.fetchUsage(
+			usageParams({ expiresAt: Date.now() + 600_000, kiroMethod: "google", accountId: "123456789012" }),
+			ctx,
+		);
+
+		expect(report?.limits[0]?.scope.accountId).toBe("123456789012");
+	});
+
+	test("surfaces an unentitled account instead of erasing it from the usage view", async () => {
+		const ctx: UsageFetchContext = {
+			fetch: async (): Promise<Response> =>
+				Response.json(
+					{ __type: "com.amazon.kiro.controlplane#AccessDeniedException", message: "not authorized" },
+					{ status: 400 },
+				),
+		};
+
+		const report = await kiroUsageProvider.fetchUsage(
+			usageParams({ expiresAt: Date.now() + 600_000, kiroMethod: "google" }),
+			ctx,
+		);
+
+		// Returning null here would drop the account silently, which is how an
+		// entitlement failure becomes invisible in `/usage`.
+		expect(report).not.toBeNull();
+		expect(report?.limits).toEqual([]);
+		expect(report?.metadata?.account).toBe("kiro google (PROPLUS)");
+		expect(report?.metadata?.unavailableReason).toBe("GetUsageLimits returned HTTP 400");
+	});
+
+	test("surfaces an empty breakdown list as a named, reasoned report", async () => {
+		const ctx: UsageFetchContext = {
+			fetch: async (): Promise<Response> =>
+				Response.json({ subscriptionInfo: { subscriptionTitle: "KIRO PRO MAX" }, usageBreakdownList: [] }),
+		};
+
+		const report = await kiroUsageProvider.fetchUsage(
+			usageParams({ expiresAt: Date.now() + 600_000, kiroMethod: "github" }),
+			ctx,
+		);
+
+		expect(report?.limits).toEqual([]);
+		expect(report?.metadata?.account).toBe("kiro github (PROPLUS)");
+		expect(report?.metadata?.subscriptionTitle).toBe("KIRO PRO MAX");
+		expect(report?.metadata?.unavailableReason).toBe("GetUsageLimits returned no usage breakdown");
+	});
+
 	test("reports the endpoint it actually queried in metadata", async () => {
 		const ctx: UsageFetchContext = {
 			fetch: async (): Promise<Response> => Response.json({ usageBreakdownList: [usageBreakdown()] }),

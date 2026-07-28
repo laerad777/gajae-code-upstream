@@ -15,6 +15,7 @@
 import { KIRO_AWS_UA, KIRO_AWS_X_AMZ_UA, KIRO_MANAGEMENT_URL, resolveKiroProfileArn } from "../providers/kiro";
 import type {
 	UsageAmount,
+	UsageCredential,
 	UsageFetchContext,
 	UsageFetchParams,
 	UsageLimit,
@@ -145,6 +146,23 @@ function redactPayload(payload: KiroUsageLimitsPayload): Record<string, unknown>
 	return { nextDateReset, overageConfiguration, subscriptionInfo, usageBreakdownList };
 }
 
+/**
+ * Kiro access tokens are opaque and the stored credential carries no email or
+ * account id, so a multi-account setup otherwise renders every row as
+ * `account N`. The login method is the only stable, non-secret discriminator
+ * available; the profile ARN suffix disambiguates two credentials that share a
+ * method.
+ */
+function resolveAccountLabel(credential: UsageCredential): string | undefined {
+	const method = typeof credential.kiroMethod === "string" ? credential.kiroMethod.trim() : "";
+	const arn = credential.kiroProfileArn?.trim() ?? "";
+	const profile = arn ? arn.slice(arn.lastIndexOf("/") + 1).trim() : "";
+	if (method && profile) return `kiro ${method} (${profile})`;
+	if (method) return `kiro ${method}`;
+	if (profile) return `kiro (${profile})`;
+	return undefined;
+}
+
 async function fetchKiroUsage(params: UsageFetchParams, ctx: UsageFetchContext): Promise<UsageReport | null> {
 	if (params.provider !== "kiro") return null;
 	const { credential } = params;
@@ -159,6 +177,7 @@ async function fetchKiroUsage(params: UsageFetchParams, ctx: UsageFetchContext):
 		return null;
 	}
 
+	const accountLabel = resolveAccountLabel(credential);
 	// A credential-supplied ARN is authoritative; resolve only when absent.
 	const profileArn =
 		credential.kiroProfileArn?.trim() || (await resolveKiroProfileArn(credential.accessToken, ctx.fetch));
@@ -179,8 +198,25 @@ async function fetchKiroUsage(params: UsageFetchParams, ctx: UsageFetchContext):
 			signal: params.signal,
 		});
 		if (!response.ok) {
-			ctx.logger?.warn("Kiro usage request failed", { provider: params.provider, status: response.status });
-			return null;
+			ctx.logger?.warn("Kiro usage request failed", {
+				provider: params.provider,
+				status: response.status,
+				account: accountLabel ?? "unlabeled",
+			});
+			// A non-ok status is an account-scoped fact (entitlement revoked, plan
+			// downgraded, profile unauthorized), not a transport hiccup. Returning
+			// null erases the account from the usage view entirely, so surface a
+			// limitless report that names the account and the reason instead.
+			return {
+				provider: params.provider,
+				fetchedAt: nowMs,
+				limits: [],
+				metadata: {
+					endpoint: KIRO_MANAGEMENT_URL,
+					...(accountLabel ? { account: accountLabel } : {}),
+					unavailableReason: `GetUsageLimits returned HTTP ${response.status}`,
+				},
+			};
 		}
 		payload = await response.json();
 	} catch (error) {
@@ -216,7 +252,7 @@ async function fetchKiroUsage(params: UsageFetchParams, ctx: UsageFetchContext):
 			label: breakdownLabel(breakdown, index),
 			scope: {
 				provider: params.provider,
-				accountId: credential.accountId,
+				accountId: credential.accountId ?? accountLabel,
 				tier: subscriptionTitle,
 				windowId: "billing-cycle",
 				shared: true,
@@ -229,8 +265,24 @@ async function fetchKiroUsage(params: UsageFetchParams, ctx: UsageFetchContext):
 	});
 
 	if (limits.length === 0) {
-		ctx.logger?.warn("Kiro usage response carried no limits", { provider: params.provider });
-		return null;
+		ctx.logger?.warn("Kiro usage response carried no limits", {
+			provider: params.provider,
+			account: accountLabel ?? "unlabeled",
+		});
+		// Keep the account visible with an explicit reason instead of dropping it.
+		return {
+			provider: params.provider,
+			fetchedAt: nowMs,
+			limits: [],
+			metadata: {
+				endpoint: KIRO_MANAGEMENT_URL,
+				...(accountLabel ? { account: accountLabel } : {}),
+				...(subscriptionTitle ? { subscriptionTitle } : {}),
+				...(subscriptionType ? { subscriptionType } : {}),
+				unavailableReason: "GetUsageLimits returned no usage breakdown",
+			},
+			raw: redactPayload(data),
+		};
 	}
 
 	return {
@@ -239,6 +291,7 @@ async function fetchKiroUsage(params: UsageFetchParams, ctx: UsageFetchContext):
 		limits,
 		metadata: {
 			endpoint: KIRO_MANAGEMENT_URL,
+			...(accountLabel ? { account: accountLabel } : {}),
 			...(subscriptionTitle ? { subscriptionTitle } : {}),
 			...(subscriptionType ? { subscriptionType } : {}),
 			...(overageStatus ? { overageStatus } : {}),

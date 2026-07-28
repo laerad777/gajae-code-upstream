@@ -627,8 +627,8 @@ describe("built-in model profile catalog", () => {
 			"CURSOR",
 			"MINIMAX",
 			"ALIBABA TOKEN PLAN",
-			"COMBOS",
 			"KIRO",
+			"COMBOS",
 		]);
 		expect(getModelProfilePresentation("alibaba-token-plan-balanced")).toEqual({
 			displayName: "Balanced",

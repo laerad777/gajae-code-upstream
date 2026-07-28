@@ -386,8 +386,8 @@ const PROFILE_GROUP_ORDER = [
 	"CURSOR",
 	"MINIMAX",
 	"ALIBABA TOKEN PLAN",
-	"COMBOS",
 	"KIRO",
+	"COMBOS",
 ];
 
 export function getModelProfilePresentation(
