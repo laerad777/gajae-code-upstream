@@ -1518,24 +1518,30 @@ function formatWindowSuffix(label: string, windowLabel: string, uiTheme: typeof 
 	return uiTheme.fg("dim", `(${windowLabel})`);
 }
 
+/** Read a string field from a report's untyped provider metadata bag. */
+function reportMetadataString(report: UsageReport, key: string): string | undefined {
+	const value = report.metadata?.[key];
+	return typeof value === "string" ? value : undefined;
+}
+
 function formatAccountLabel(limit: UsageLimit, report: UsageReport, index: number): string {
-	const email = (report.metadata?.email as string | undefined) ?? limit.scope.accountId;
+	const email = reportMetadataString(report, "email") ?? limit.scope.accountId;
 	if (email) return email;
-	const accountId = (report.metadata?.accountId as string | undefined) ?? limit.scope.accountId;
+	const accountId = reportMetadataString(report, "accountId") ?? limit.scope.accountId;
 	if (accountId) return accountId;
 	// Providers with opaque tokens (Kiro) carry no email/accountId, so they
 	// publish a derived, non-secret account label instead of nothing.
-	const account = report.metadata?.account as string | undefined;
+	const account = reportMetadataString(report, "account");
 	if (account) return account;
 	return `account ${index + 1}`;
 }
 
 function formatUnlimitedReportLabel(report: UsageReport, index: number): string {
-	const email = report.metadata?.email as string | undefined;
+	const email = reportMetadataString(report, "email");
 	if (email) return email;
-	const accountId = report.metadata?.accountId as string | undefined;
+	const accountId = reportMetadataString(report, "accountId");
 	if (accountId) return accountId;
-	const account = report.metadata?.account as string | undefined;
+	const account = reportMetadataString(report, "account");
 	if (account) return account;
 	return `account ${index + 1}`;
 }
@@ -1818,11 +1824,9 @@ export function renderUsageReports(
 			// metadata fall back to distinct `account N` labels instead of every
 			// row collapsing onto `account 1`.
 			const label = formatUnlimitedReportLabel(report, unlimitedIndex);
-			const tier =
-				(report.metadata?.planType as string | undefined) ??
-				(report.metadata?.subscriptionTitle as string | undefined);
+			const tier = reportMetadataString(report, "planType") ?? reportMetadataString(report, "subscriptionTitle");
 			const tierSuffix = tier ? ` ${uiTheme.fg("dim", `(${tier})`)}` : "";
-			const unavailableReason = report.metadata?.unavailableReason as string | undefined;
+			const unavailableReason = reportMetadataString(report, "unavailableReason");
 			if (unavailableReason) {
 				lines.push(
 					`${uiTheme.fg("error", uiTheme.status.error)} ${label}${tierSuffix} ${uiTheme.fg("dim", `-- unavailable: ${unavailableReason}`)}`,
