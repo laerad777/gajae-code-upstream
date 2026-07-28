@@ -28,11 +28,10 @@ import { transformMessages } from "./transform-messages";
 export const KIRO_REGION = "us-east-1";
 export const KIRO_RUNTIME_URL = `https://runtime.${KIRO_REGION}.kiro.dev/`;
 export const KIRO_MANAGEMENT_URL = `https://management.${KIRO_REGION}.kiro.dev/`;
-// Builder ID login no longer persists a synthetic profile ARN. The value
-// kiro-cli 2.14.2 hardcodes is `arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX`
-// (reverse-engineered), but writing it into the credential would occupy the
-// authoritative slot with an unconfirmed value, so a stale constant would
-// silently 403 forever instead of falling back to `resolveKiroProfileArn`.
+// Kiro CLI 2.14.2 uses this shared CodeWhisperer profile ARN for Builder ID.
+// Unlike social credentials, Builder ID tokens cannot call ListAvailableProfiles;
+// omitting this value therefore makes model discovery and usage fail with HTTP 400.
+export const KIRO_BUILDER_ID_PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
 export const KIRO_ORIGIN = "KIRO_CLI";
 
 /**

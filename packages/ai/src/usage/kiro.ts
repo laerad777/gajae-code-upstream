@@ -12,7 +12,13 @@
  * and the stored credential carries no email or account id, so the token itself
  * is the only identity input available here.
  */
-import { KIRO_AWS_UA, KIRO_AWS_X_AMZ_UA, KIRO_MANAGEMENT_URL, resolveKiroProfileArn } from "../providers/kiro";
+import {
+	KIRO_AWS_UA,
+	KIRO_AWS_X_AMZ_UA,
+	KIRO_BUILDER_ID_PROFILE_ARN,
+	KIRO_MANAGEMENT_URL,
+	resolveKiroProfileArn,
+} from "../providers/kiro";
 import type {
 	UsageAmount,
 	UsageCredential,
@@ -149,18 +155,42 @@ function redactPayload(payload: KiroUsageLimitsPayload): Record<string, unknown>
 /**
  * Kiro access tokens are opaque and the stored credential carries no email or
  * account id, so a multi-account setup otherwise renders every row as
- * `account N`. The login method is the only stable, non-secret discriminator
- * available; the profile ARN suffix disambiguates two credentials that share a
- * method.
+ * `account N`. The login method plus the profile ARN suffix is the only stable,
+ * non-secret discriminator available.
+ *
+ * The Builder ID ARN is deliberately excluded: every Builder ID credential
+ * carries Kiro CLI's single hardcoded profile, so using it as a suffix would
+ * attach an identical, meaningless `(AAAACCCCXXXX)` to every Builder ID row
+ * without disambiguating anything. Social ARNs are per-account and do
+ * discriminate, so they are kept.
  */
-function resolveAccountLabel(credential: UsageCredential): string | undefined {
+function resolveAccountLabel(credential: UsageCredential): string {
 	const method = typeof credential.kiroMethod === "string" ? credential.kiroMethod.trim() : "";
 	const arn = credential.kiroProfileArn?.trim() ?? "";
-	const profile = arn ? arn.slice(arn.lastIndexOf("/") + 1).trim() : "";
+	const profile = arn && arn !== KIRO_BUILDER_ID_PROFILE_ARN ? arn.slice(arn.lastIndexOf("/") + 1).trim() : "";
 	if (method && profile) return `kiro ${method} (${profile})`;
 	if (method) return `kiro ${method}`;
 	if (profile) return `kiro (${profile})`;
-	return undefined;
+	// Credentials created before login-method persistence used Builder ID.
+	return "kiro builder-id";
+}
+
+function unavailableReport(accountLabel: string, nowMs: number, reason: string): UsageReport {
+	return {
+		provider: "kiro",
+		fetchedAt: nowMs,
+		limits: [],
+		metadata: {
+			endpoint: KIRO_MANAGEMENT_URL,
+			account: accountLabel,
+			unavailableReason: reason,
+		},
+	};
+}
+
+function resolveHttpStatus(error: unknown): number | undefined {
+	if (!isRecord(error)) return undefined;
+	return typeof error.status === "number" ? error.status : undefined;
 }
 
 async function fetchKiroUsage(params: UsageFetchParams, ctx: UsageFetchContext): Promise<UsageReport | null> {
@@ -178,9 +208,26 @@ async function fetchKiroUsage(params: UsageFetchParams, ctx: UsageFetchContext):
 	}
 
 	const accountLabel = resolveAccountLabel(credential);
-	// A credential-supplied ARN is authoritative; resolve only when absent.
-	const profileArn =
-		credential.kiroProfileArn?.trim() || (await resolveKiroProfileArn(credential.accessToken, ctx.fetch));
+	// Social credentials carry a server-confirmed ARN. Builder ID uses the
+	// shared Kiro CLI profile because its token cannot call ListAvailableProfiles.
+	const method = credential.kiroMethod;
+	let profileArn =
+		credential.kiroProfileArn?.trim() ||
+		(method === "builder-id" || method === undefined ? KIRO_BUILDER_ID_PROFILE_ARN : undefined);
+	if (!profileArn) {
+		try {
+			profileArn = await resolveKiroProfileArn(credential.accessToken, ctx.fetch);
+		} catch (error) {
+			const status = resolveHttpStatus(error);
+			const reason = status ? `Profile resolution returned HTTP ${status}` : "Profile resolution failed";
+			ctx.logger?.warn("Kiro profile resolution failed", {
+				provider: params.provider,
+				account: accountLabel ?? "unlabeled",
+				...(status ? { status } : {}),
+			});
+			return unavailableReport(accountLabel, nowMs, reason);
+		}
+	}
 
 	let payload: unknown;
 	try {
@@ -207,16 +254,7 @@ async function fetchKiroUsage(params: UsageFetchParams, ctx: UsageFetchContext):
 			// downgraded, profile unauthorized), not a transport hiccup. Returning
 			// null erases the account from the usage view entirely, so surface a
 			// limitless report that names the account and the reason instead.
-			return {
-				provider: params.provider,
-				fetchedAt: nowMs,
-				limits: [],
-				metadata: {
-					endpoint: KIRO_MANAGEMENT_URL,
-					...(accountLabel ? { account: accountLabel } : {}),
-					unavailableReason: `GetUsageLimits returned HTTP ${response.status}`,
-				},
-			};
+			return unavailableReport(accountLabel, nowMs, `GetUsageLimits returned HTTP ${response.status}`);
 		}
 		payload = await response.json();
 	} catch (error) {

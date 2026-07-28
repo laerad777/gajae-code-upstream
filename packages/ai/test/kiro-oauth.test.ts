@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDbPath, getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { KIRO_BUILDER_ID_PROFILE_ARN } from "../src/providers/kiro";
 import { loginKiro, refreshKiroToken } from "../src/utils/oauth/kiro";
 
 const REGISTRATION_KEY = "kirocli:odic:device-registration";
@@ -160,6 +161,18 @@ describe("Kiro device registration store", () => {
 
 		const refreshed = await refreshKiroToken({ access: "a", refresh: "r", expires: 1 });
 		expect(refreshed.kiroMethod).toBe("builder-id");
+	});
+
+	test("backfills the shared Builder ID profile when the credential slot is empty", async () => {
+		await useTempAgentDir();
+		seedRegistration(validRegistration());
+		stubFetch(async () => Response.json({ accessToken: "new-access", refreshToken: "new-refresh" }));
+
+		// Builder ID tokens cannot call ListAvailableProfiles, so a credential
+		// minted before ARN persistence must gain the routing value on refresh
+		// rather than staying empty and forcing a doomed discovery call.
+		const refreshed = await refreshKiroToken({ access: "a", refresh: "r", expires: 1 });
+		expect(refreshed.kiroProfileArn).toBe(KIRO_BUILDER_ID_PROFILE_ARN);
 	});
 
 	test("an unparseable stored payload fails closed without registering", async () => {

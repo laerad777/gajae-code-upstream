@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { KIRO_MANAGEMENT_URL, resetKiroProfileArnCache } from "../src/providers/kiro";
+import { KIRO_BUILDER_ID_PROFILE_ARN, KIRO_MANAGEMENT_URL, resetKiroProfileArnCache } from "../src/providers/kiro";
 import type { UsageFetchContext, UsageFetchParams } from "../src/usage";
 import { kiroUsageProvider } from "../src/usage/kiro";
 
@@ -194,14 +194,70 @@ describe("Kiro usage provider", () => {
 			},
 		};
 
-		// A Builder ID credential persists no ARN, so the empty slot must resolve.
-		const params = usageParams({ expiresAt: Date.now() + 600_000, kiroProfileArn: undefined });
+		// Social credentials normally persist an ARN, but a missing legacy slot
+		// still resolves once and then uses the per-token cache.
+		const params = usageParams({
+			expiresAt: Date.now() + 600_000,
+			kiroMethod: "google",
+			kiroProfileArn: undefined,
+		});
 		expect(await kiroUsageProvider.fetchUsage(params, ctx)).not.toBeNull();
 		expect(amzTargets.filter(target => target.endsWith("ListAvailableProfiles"))).toHaveLength(1);
 
 		// The resolution is memoized, so a second probe issues no further lookup.
 		expect(await kiroUsageProvider.fetchUsage(params, ctx)).not.toBeNull();
 		expect(amzTargets.filter(target => target.endsWith("ListAvailableProfiles"))).toHaveLength(1);
+	});
+
+	test("uses the shared Kiro CLI profile for Builder ID without listing profiles", async () => {
+		const amzTargets: string[] = [];
+		const bodies: string[] = [];
+		const ctx: UsageFetchContext = {
+			fetch: async (_input, init): Promise<Response> => {
+				const request = new Request(KIRO_MANAGEMENT_URL, init);
+				amzTargets.push(String(request.headers.get("x-amz-target")));
+				bodies.push(await request.text());
+				return Response.json({ usageBreakdownList: [usageBreakdown()] });
+			},
+		};
+
+		const report = await kiroUsageProvider.fetchUsage(
+			usageParams({
+				expiresAt: Date.now() + 600_000,
+				kiroMethod: "builder-id",
+				kiroProfileArn: undefined,
+			}),
+			ctx,
+		);
+
+		expect(report?.limits).toHaveLength(1);
+		expect(report?.metadata?.account).toBe("kiro builder-id");
+		expect(amzTargets).toEqual(["AmazonCodeWhispererService.GetUsageLimits"]);
+		expect(JSON.parse(bodies[0] ?? "{}")).toEqual({ profileArn: KIRO_BUILDER_ID_PROFILE_ARN });
+	});
+
+	test("backfills the Builder ID profile for legacy method-less credentials", async () => {
+		const bodies: string[] = [];
+		const ctx: UsageFetchContext = {
+			fetch: async (_input, init): Promise<Response> => {
+				const request = new Request(KIRO_MANAGEMENT_URL, init);
+				bodies.push(await request.text());
+				return Response.json({ usageBreakdownList: [usageBreakdown()] });
+			},
+		};
+
+		const report = await kiroUsageProvider.fetchUsage(
+			usageParams({
+				expiresAt: Date.now() + 600_000,
+				kiroMethod: undefined,
+				kiroProfileArn: undefined,
+			}),
+			ctx,
+		);
+
+		expect(report?.limits).toHaveLength(1);
+		expect(report?.metadata?.account).toBe("kiro builder-id");
+		expect(JSON.parse(bodies[0] ?? "{}")).toEqual({ profileArn: KIRO_BUILDER_ID_PROFILE_ARN });
 	});
 
 	test("declines non-Kiro providers and api-key credentials", () => {

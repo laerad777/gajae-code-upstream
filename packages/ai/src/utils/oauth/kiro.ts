@@ -31,6 +31,7 @@
 import { Database } from "bun:sqlite";
 import { scheduler } from "node:timers/promises";
 import { getAgentDbPath, logger } from "@gajae-code/utils";
+import { KIRO_BUILDER_ID_PROFILE_ARN } from "../../providers/kiro";
 import { redactedHttpErrorSummary } from "../http-error-redaction";
 import type { KiroLoginMethod, OAuthCredentials } from "./types";
 
@@ -381,10 +382,13 @@ export async function loginKiro(options: KiroLoginOptions): Promise<OAuthCredent
 	const credentials = await pollForToken(registration, deviceCode, interval, expiresIn, options.signal);
 	options.onProgress?.("Logged in to Kiro.");
 
-	// Builder ID has no server-supplied profile ARN; usage resolves it on first use.
+	// Builder ID uses Kiro CLI's shared CodeWhisperer profile. Builder ID tokens
+	// cannot call ListAvailableProfiles, so persist the authoritative routing
+	// value at login instead of attempting discovery on first use.
 	return {
 		...credentials,
 		kiroMethod: method,
+		kiroProfileArn: KIRO_BUILDER_ID_PROFILE_ARN,
 	};
 }
 
@@ -559,12 +563,14 @@ export async function refreshKiroToken(credentials: OAuthCredentials): Promise<O
 		throw new Error(`Kiro token refresh failed: ${error}${description ? `: ${description}` : ""}`);
 	}
 	const expiresInToken = typeof token.expiresIn === "number" ? token.expiresIn : 28800;
-	// Preserve Kiro routing metadata from the incoming credential.
+	// Preserve Kiro routing metadata from the incoming credential and backfill
+	// the Builder ID profile for credentials created before it was persisted.
 	return {
 		...credentials,
 		access: assertString(token.accessToken, "accessToken"),
 		refresh: assertString(token.refreshToken ?? credentials.refresh, "refreshToken"),
 		expires: Date.now() + expiresInToken * 1000 - OAUTH_EXPIRY_SKEW_MS,
 		kiroMethod: credentials.kiroMethod ?? "builder-id",
+		kiroProfileArn: credentials.kiroProfileArn ?? KIRO_BUILDER_ID_PROFILE_ARN,
 	};
 }

@@ -370,7 +370,7 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"alibaba-token-plan-balanced": { displayName: "Balanced", providerGroup: "ALIBABA TOKEN PLAN" },
 	"alibaba-token-plan-qwenmaxxing": { displayName: "QwenMaxxing", providerGroup: "ALIBABA TOKEN PLAN" },
 	"opus-codex": { displayName: "Opus + Codex", providerGroup: "COMBOS" },
-	"kiro-opus-gpt": { displayName: "Kiro Opus + GPT-5.6", providerGroup: "COMBOS" },
+	"kiro-opus-gpt": { displayName: "Kiro Opus + GPT-5.6", providerGroup: "KIRO" },
 	"codex-opencodego": { displayName: "Codex + OpenCodeGo", providerGroup: "COMBOS" },
 	"fable-opus-codex": { displayName: "Fable + Opus + Codex", providerGroup: "COMBOS" },
 };
