@@ -194,15 +194,14 @@ const GOOGLE_GEMINI_CLI_LAZY_STREAM_LIMITS: LazyStreamLimits = {
 };
 /**
  * Providers whose first streamed event legitimately lands after the global
- * 100s floor. Kiro's runtime serves reasoning tiers (Claude Opus/Sonnet 5,
- * GPT-5.6) whose cold start regularly exceeds it, so the shared default
- * aborted healthy requests before the first event arrived.
+ * 100s floor and do not own wrapper-specific limits.
  */
-const SLOW_FIRST_EVENT_PROVIDERS = new Set(["alibaba-token-plan", "kimi-code", "kiro"]);
+const SLOW_FIRST_EVENT_PROVIDERS = new Set(["alibaba-token-plan", "kimi-code"]);
 
 /**
- * Kiro's steady-state gaps are as slow as its cold start. The same reasoning
- * tiers go silent between tokens for longer than the shared 120s idle floor
+ * Kiro owns both watchdog floors at the wrapper level so custom/aliased
+ * provider names retain the same behavior. Its reasoning tiers can exceed the
+ * shared first-event floor and go silent between tokens longer than the 120s idle floor
  * while the upstream plans a tool call, so the watchdog aborted mid-response
  * with `Provider stream stalled while waiting for the next event`. That abort
  * is only auto-retried when the turn is still replay-safe, so a stall after a
@@ -210,6 +209,7 @@ const SLOW_FIRST_EVENT_PROVIDERS = new Set(["alibaba-token-plan", "kimi-code", "
  * floor to match the five-minute first-event floor above.
  */
 export const KIRO_LAZY_STREAM_LIMITS: LazyStreamLimits = {
+	defaultFirstEventTimeoutMs: 300_000,
 	defaultIdleTimeoutMs: 300_000,
 };
 

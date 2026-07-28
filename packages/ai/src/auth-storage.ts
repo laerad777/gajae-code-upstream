@@ -2066,7 +2066,7 @@ export class AuthStorage {
 	// Queries provider usage endpoints to detect rate limits before they occur.
 	// ─────────────────────────────────────────────────────────────────────────────
 
-	#buildUsageCredential(credential: OAuthCredential): UsageCredential {
+	#buildUsageCredential(credential: OAuthCredential, credentialId?: number): UsageCredential {
 		return {
 			type: "oauth",
 			accessToken: credential.access,
@@ -2078,6 +2078,7 @@ export class AuthStorage {
 			enterpriseUrl: credential.enterpriseUrl,
 			kiroMethod: credential.kiroMethod,
 			kiroProfileArn: credential.kiroProfileArn,
+			credentialId,
 		};
 	}
 
@@ -2135,8 +2136,9 @@ export class AuthStorage {
 		provider: Provider,
 		credential: OAuthCredential,
 		baseUrl?: string,
+		credentialId?: number,
 	): UsageRequestDescriptor {
-		return this.#buildUsageRequest(provider, this.#buildUsageCredential(credential), baseUrl);
+		return this.#buildUsageRequest(provider, this.#buildUsageCredential(credential, credentialId), baseUrl);
 	}
 
 	#buildRefreshableOauthCredential(credential: UsageCredential): OAuthCredential | null {
@@ -2380,7 +2382,7 @@ export class AuthStorage {
 				const request =
 					credential.type === "api_key"
 						? this.#buildUsageRequest(provider, { type: "api_key", apiKey: credential.key }, baseUrl)
-						: this.#buildUsageRequestForOauth(provider, credential, baseUrl);
+						: this.#buildUsageRequestForOauth(provider, credential, baseUrl, entry.id);
 				if (providerImpl.supports && !providerImpl.supports(request)) continue;
 				requests.push(request);
 			}
@@ -3636,6 +3638,11 @@ export class AuthStorage {
 		const markSuspect = this.#store.markCredentialSuspect?.bind(this.#store);
 		if (markSuspect) {
 			await markSuspect(matched.id, { signal });
+		} else if (provider === "kiro" && matched.type === "oauth") {
+			// Kiro social access tokens can be invalidated by another client refresh
+			// hours before their local expiry timestamp. A 401/403 therefore needs a
+			// real refresh of the same pinned credential, not merely a snapshot reload.
+			await this.refreshCredentialById(matched.id, signal);
 		} else {
 			await this.reload();
 		}

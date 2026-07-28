@@ -1,14 +1,33 @@
 import { Database } from "bun:sqlite";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDbPath, getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { AuthStorage } from "../src/auth-storage";
 import { KIRO_BUILDER_ID_PROFILE_ARN } from "../src/providers/kiro";
-import { loginKiro, refreshKiroToken } from "../src/utils/oauth/kiro";
+import { getOAuthApiKey } from "../src/utils/oauth";
+import { loginKiro, refreshKiroSocialToken, refreshKiroToken } from "../src/utils/oauth/kiro";
 
 const REGISTRATION_KEY = "kirocli:odic:device-registration";
 const MISSING_REGISTRATION = "Kiro client registration is missing or expired";
+
+test("Kiro request credentials omit the unused refresh token", async () => {
+	const result = await getOAuthApiKey("kiro", {
+		kiro: {
+			access: "access-token",
+			refresh: "refresh-token-must-not-leave-storage",
+			expires: Date.now() + 60_000,
+			kiroMethod: "builder-id",
+			kiroProfileArn: KIRO_BUILDER_ID_PROFILE_ARN,
+		},
+	});
+	if (!result) throw new Error("expected a Kiro OAuth API key");
+	const payload = JSON.parse(result.apiKey) as Record<string, unknown>;
+	expect(payload.token).toBe("access-token");
+	expect(payload.kiroProfileArn).toBe(KIRO_BUILDER_ID_PROFILE_ARN);
+	expect(payload).not.toHaveProperty("refreshToken");
+});
 
 let previousAgentDir: string | undefined;
 let previousPiConfigDir: string | undefined;
@@ -123,6 +142,26 @@ describe("Kiro device registration store", () => {
 		expect(requests).toHaveLength(1);
 	});
 
+	test("fails the login immediately when a new registration cannot be persisted", async () => {
+		await useTempAgentDir();
+		const requests = stubFetch(async () => {
+			// The cold-start read already completed. Replacing the expected DB file
+			// with a directory makes the subsequent registration write fail.
+			await fs.mkdir(getAgentDbPath());
+			return Response.json({
+				clientId: "client-abc",
+				clientSecret: "secret-xyz",
+				clientIdIssuedAt: 1_700_000_000,
+				clientSecretExpiresAt: Math.floor(Date.now() / 1000) + 90 * 24 * 60 * 60,
+			});
+		});
+		const onAuth = mock(() => {});
+
+		await expect(loginKiro({ onAuth, onPrompt: async () => "", method: "builder-id" })).rejects.toThrow();
+		expect(requests).toHaveLength(1);
+		expect(onAuth).not.toHaveBeenCalled();
+	});
+
 	test("a valid persisted registration is found and drives the token request", async () => {
 		await useTempAgentDir();
 		const registration = validRegistration();
@@ -219,6 +258,34 @@ describe("Kiro OAuth error redaction adoption", () => {
 		expect(message).toBe(`${expectedPrefix}: HTTP 400`);
 	}
 
+	test("rejects a social refresh that switches the persisted profile ARN", async () => {
+		const storedArn = "arn:aws:codewhisperer:us-east-1:111111111111:profile/MINE";
+		const rotatedArn = "arn:aws:codewhisperer:us-east-1:999999999999:profile/OTHER";
+		stubFetch(async () =>
+			Response.json({
+				accessToken: "new-access",
+				refreshToken: "new-refresh",
+				expiresIn: 28_800,
+				profileArn: rotatedArn,
+			}),
+		);
+
+		const error = await refreshKiroSocialToken(
+			{
+				access: "old-access",
+				refresh: "old-refresh",
+				expires: 1,
+				kiroMethod: "google",
+				kiroProfileArn: storedArn,
+			},
+			"google",
+		).catch((cause: unknown) => cause);
+		const message = error instanceof Error ? error.message : String(error);
+		expect(message).toBe("Kiro social token refresh failed: profile ARN changed");
+		expect(message).not.toContain("111111111111");
+		expect(message).not.toContain("999999999999");
+	});
+
 	test("registerClient returns a status-only error without consuming the body", async () => {
 		await useTempAgentDir();
 		const response = new Response(leakyBody, { status: 400 });
@@ -295,5 +362,92 @@ describe("Kiro OAuth error redaction adoption", () => {
 
 		expectStatusOnly(error instanceof Error ? error.message : String(error), "Kiro social device poll failed");
 		expect(response.bodyUsed).toBe(false);
+	});
+
+	test("social refresh returns a status-only error without consuming the body", async () => {
+		const response = new Response(leakyBody, { status: 400 });
+		stubFetch(async () => response);
+
+		const error = await refreshKiroSocialToken(
+			{ access: "old-access", refresh: "old-refresh", expires: 1, kiroMethod: "google" },
+			"google",
+		).catch((cause: unknown) => cause);
+
+		expectStatusOnly(error instanceof Error ? error.message : String(error), "Kiro social token refresh failed");
+		expect(response.bodyUsed).toBe(false);
+	});
+});
+
+describe("Kiro social refresh resilience", () => {
+	test("force-refreshes a supposedly fresh social credential after an upstream auth rejection", async () => {
+		await useTempAgentDir();
+		const profileArn = "arn:aws:codewhisperer:us-east-1:123456789012:profile/social-test";
+		const storage = await AuthStorage.create(getAgentDbPath());
+		try {
+			await storage.set("kiro", [
+				{
+					type: "oauth",
+					access: "rejected-but-unexpired-access",
+					refresh: "still-valid-refresh",
+					expires: Date.now() + 4 * 60 * 60_000,
+					kiroMethod: "google",
+					kiroProfileArn: profileArn,
+				},
+			]);
+			const requests = stubFetch(async () =>
+				Response.json({
+					accessToken: "forced-fresh-access",
+					refreshToken: "forced-fresh-refresh",
+					expiresIn: 28_800,
+					profileArn,
+				}),
+			);
+
+			const invalidated = await storage.invalidateCredentialMatching(
+				"kiro",
+				JSON.stringify({ token: "rejected-but-unexpired-access", profileArn, kiroMethod: "google" }),
+			);
+			expect(invalidated).toBe(true);
+			expect(requests).toHaveLength(1);
+
+			const db = new Database(getAgentDbPath(), { readonly: true });
+			try {
+				const row = db.prepare("SELECT data FROM auth_credentials WHERE provider = ?").get("kiro") as {
+					data: string;
+				};
+				const persisted = JSON.parse(row.data) as { access?: string; refresh?: string; kiroProfileArn?: string };
+				expect(persisted).toMatchObject({
+					access: "forced-fresh-access",
+					refresh: "forced-fresh-refresh",
+					kiroProfileArn: profileArn,
+				});
+			} finally {
+				db.close();
+			}
+		} finally {
+			storage.close();
+		}
+	});
+
+	test("keeps a legacy credential usable when refresh omits profileArn", async () => {
+		stubFetch(async () =>
+			Response.json({ accessToken: "new-access", refreshToken: "new-refresh", expiresIn: 28_800 }),
+		);
+		const refreshed = await refreshKiroSocialToken(
+			{ access: "old-access", refresh: "old-refresh", expires: 1, kiroMethod: "google" },
+			"google",
+		);
+		expect(refreshed.access).toBe("new-access");
+		expect(refreshed.kiroProfileArn).toBeUndefined();
+	});
+
+	test("falls back to the normal TTL when refresh returns zero expiresIn", async () => {
+		stubFetch(async () => Response.json({ accessToken: "new-access", refreshToken: "new-refresh", expiresIn: 0 }));
+		const before = Date.now();
+		const refreshed = await refreshKiroSocialToken(
+			{ access: "old-access", refresh: "old-refresh", expires: 1, kiroMethod: "github" },
+			"github",
+		);
+		expect(refreshed.expires).toBeGreaterThan(before + 7 * 60 * 60 * 1000);
 	});
 });

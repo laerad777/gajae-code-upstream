@@ -499,7 +499,7 @@ export async function getOAuthApiKey(
 				token: creds.access,
 				enterpriseUrl: creds.enterpriseUrl,
 				projectId: creds.projectId,
-				refreshToken: creds.refresh,
+				...(provider === "kiro" ? {} : { refreshToken: creds.refresh }),
 				expiresAt: creds.expires,
 				email: creds.email,
 				accountId: creds.accountId,

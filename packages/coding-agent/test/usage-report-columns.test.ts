@@ -170,4 +170,21 @@ describe("usage report column ordering", () => {
 		expect(output).toContain("account 1 -- unavailable: HTTP 403");
 		expect(output).toContain("account 2 -- unavailable: HTTP 400");
 	});
+
+	test("continues positional numbering after limited accounts", () => {
+		const limited = report("", 0.5, 0.25);
+		limited.provider = "kiro";
+		limited.metadata = {};
+		for (const entry of limited.limits) entry.scope = { ...entry.scope, provider: "kiro" };
+		const unavailable: UsageReport = {
+			provider: "kiro",
+			fetchedAt: NOW,
+			limits: [],
+			metadata: { unavailableReason: "HTTP 403" },
+		};
+
+		const output = stripAnsi(renderUsageReports([limited, unavailable], theme, NOW, 100));
+		expect(output).toContain("account 2 -- unavailable: HTTP 403");
+		expect(output).not.toContain("account 1 -- unavailable: HTTP 403");
+	});
 });

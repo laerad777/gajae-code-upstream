@@ -24,6 +24,7 @@ function createHarness() {
 	const editorContainer = new Container();
 	const login = mock(async (_providerId: string) => {});
 	const logout = mock(async (_providerId: string) => {});
+	const setActiveModelProfile = mock(async (_profileId: string) => {});
 	const errors: string[] = [];
 	const ui = { setFocus: mock(() => {}), requestRender: mock(() => {}) };
 	const ctx = {
@@ -39,6 +40,7 @@ function createHarness() {
 		settings: { get: () => undefined },
 		session: {
 			sessionId: "kiro-selector-test",
+			setActiveModelProfile,
 			modelRegistry: {
 				authStorage: { hasAuth: () => false, login, logout },
 				refresh: mock(async () => {}),
@@ -48,7 +50,16 @@ function createHarness() {
 		},
 	} as unknown as InteractiveModeContext;
 
-	return { controller: new SelectorController(ctx), editor, editorContainer, errors, login, logout, ui };
+	return {
+		controller: new SelectorController(ctx),
+		editor,
+		editorContainer,
+		errors,
+		login,
+		logout,
+		setActiveModelProfile,
+		ui,
+	};
 }
 
 function activeSelector(harness: SelectorHarness): OAuthSelectorComponent | KiroLoginMethodSelectorComponent {
@@ -147,6 +158,7 @@ describe("SelectorController Kiro login routing", () => {
 		await Promise.resolve();
 		expect(harness.login).toHaveBeenCalledTimes(3);
 		expect(harness.login.mock.calls.map(call => call[0])).toEqual(["kiro", "kiro", "kiro"]);
+		expect(harness.setActiveModelProfile).not.toHaveBeenCalled();
 	});
 
 	it("bypasses the nested selector for Kiro logout", async () => {

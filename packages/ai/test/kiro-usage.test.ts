@@ -310,6 +310,22 @@ describe("Kiro usage provider", () => {
 		expect(report?.limits[0]?.scope.accountId).toBe("123456789012");
 	});
 
+	test("keeps Builder ID usage scopes distinct by stored credential id", async () => {
+		const ctx: UsageFetchContext = {
+			fetch: async (): Promise<Response> => Response.json({ usageBreakdownList: [usageBreakdown()] }),
+		};
+		const first = await kiroUsageProvider.fetchUsage(
+			usageParams({ expiresAt: Date.now() + 600_000, kiroMethod: "builder-id", credentialId: 11 }),
+			ctx,
+		);
+		const second = await kiroUsageProvider.fetchUsage(
+			usageParams({ expiresAt: Date.now() + 600_000, kiroMethod: "builder-id", credentialId: 12 }),
+			ctx,
+		);
+		expect(first?.limits[0]?.scope.accountId).toBe("credential:11");
+		expect(second?.limits[0]?.scope.accountId).toBe("credential:12");
+	});
+
 	test("surfaces an unentitled account instead of erasing it from the usage view", async () => {
 		const ctx: UsageFetchContext = {
 			fetch: async (): Promise<Response> =>

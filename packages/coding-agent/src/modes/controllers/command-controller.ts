@@ -1819,11 +1819,11 @@ export function renderUsageReports(
 		// Render accounts with no rate limits (e.g. business/enterprise plans) or
 		// account-scoped usage failures that must remain visible.
 		const unlimitedReports = providerReports.filter(report => report.limits.length === 0);
-		unlimitedReports.forEach((report, unlimitedIndex) => {
+		unlimitedReports.forEach(report => {
 			// Pass the real position so multiple credentials without any account
 			// metadata fall back to distinct `account N` labels instead of every
 			// row collapsing onto `account 1`.
-			const label = formatUnlimitedReportLabel(report, unlimitedIndex);
+			const label = formatUnlimitedReportLabel(report, providerReports.indexOf(report));
 			const tier = reportMetadataString(report, "planType") ?? reportMetadataString(report, "subscriptionTitle");
 			const tierSuffix = tier ? ` ${uiTheme.fg("dim", `(${tier})`)}` : "";
 			const unavailableReason = reportMetadataString(report, "unavailableReason");

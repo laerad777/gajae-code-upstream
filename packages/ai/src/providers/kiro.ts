@@ -9,6 +9,7 @@ import type {
 	ImageContent,
 	Message,
 	Model,
+	ProviderSessionState,
 	SimpleStreamOptions,
 	StopReason,
 	StreamFunction,
@@ -20,7 +21,8 @@ import type {
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
 import { redactedHttpErrorSummary } from "../utils/http-error-redaction";
-import { parseStreamingJson } from "../utils/json-parse";
+import { isCompleteJson, parseStreamingJson } from "../utils/json-parse";
+import { resolveRetryBudget } from "../utils/retry-budget";
 import { flattenToolRootCombinators, toolWireSchema } from "../utils/schema";
 import { decodeEventStream } from "./aws-eventstream";
 import { transformMessages } from "./transform-messages";
@@ -97,7 +99,9 @@ interface KiroProfilesPayload {
  * profile — and the map stays bounded so long sessions cannot grow it.
  */
 const KIRO_PROFILE_ARN_CACHE = new Map<string, string>();
+const KIRO_PROFILE_ARN_IN_FLIGHT = new Map<string, Promise<string>>();
 const KIRO_PROFILE_ARN_CACHE_MAX = 8;
+let kiroProfileArnCacheGeneration = 0;
 
 function kiroProfileCacheKey(accessToken: string): string {
 	return nodeCrypto.createHash("sha256").update(accessToken).digest("hex");
@@ -114,17 +118,56 @@ function cacheProfileArn(cacheKey: string, profileArn: string): string {
 
 /** Test seam: drop memoized profile resolutions. */
 export function resetKiroProfileArnCache(): void {
+	kiroProfileArnCacheGeneration += 1;
 	KIRO_PROFILE_ARN_CACHE.clear();
+	KIRO_PROFILE_ARN_IN_FLIGHT.clear();
 }
 
-export async function resolveKiroProfileArn(accessToken: string, fetcher: KiroFetcher = fetch): Promise<string> {
+interface KiroProfileRequestOptions {
+	signal?: AbortSignal;
+	headers?: Record<string, string>;
+}
+
+export async function resolveKiroProfileArn(
+	accessToken: string,
+	fetcher: KiroFetcher = fetch,
+	options?: KiroProfileRequestOptions,
+): Promise<string> {
 	const cacheKey = kiroProfileCacheKey(accessToken);
 	const cached = KIRO_PROFILE_ARN_CACHE.get(cacheKey);
 	if (cached) return cached;
+	if (options?.signal) {
+		return resolveKiroProfileArnUncached(accessToken, cacheKey, kiroProfileArnCacheGeneration, fetcher, options);
+	}
+	const inFlight = KIRO_PROFILE_ARN_IN_FLIGHT.get(cacheKey);
+	if (inFlight) return inFlight;
+	const resolution = resolveKiroProfileArnUncached(
+		accessToken,
+		cacheKey,
+		kiroProfileArnCacheGeneration,
+		fetcher,
+		options,
+	);
+	KIRO_PROFILE_ARN_IN_FLIGHT.set(cacheKey, resolution);
+	try {
+		return await resolution;
+	} finally {
+		if (KIRO_PROFILE_ARN_IN_FLIGHT.get(cacheKey) === resolution) KIRO_PROFILE_ARN_IN_FLIGHT.delete(cacheKey);
+	}
+}
+
+async function resolveKiroProfileArnUncached(
+	accessToken: string,
+	cacheKey: string,
+	cacheGeneration: number,
+	fetcher: KiroFetcher,
+	options?: KiroProfileRequestOptions,
+): Promise<string> {
 	const response = await fetcher(KIRO_MANAGEMENT_URL, {
 		method: "POST",
 		headers: {
-			Authorization: `Bearer ${accessToken}`,
+			...options?.headers,
+			Authorization: ["Bearer", accessToken].join(" "),
 			"Content-Type": "application/x-amz-json-1.0",
 			"x-amz-target": KIRO_LIST_PROFILES_TARGET,
 			"User-Agent": KIRO_AWS_UA,
@@ -135,6 +178,7 @@ export async function resolveKiroProfileArn(accessToken: string, fetcher: KiroFe
 			"accept-encoding": "gzip",
 		},
 		body: "{}",
+		signal: options?.signal,
 	});
 	if (!response.ok) {
 		throw Object.assign(new Error(`Kiro profile resolution failed: ${redactedHttpErrorSummary(response)}`), {
@@ -145,7 +189,11 @@ export async function resolveKiroProfileArn(accessToken: string, fetcher: KiroFe
 	if (Array.isArray(payload.profiles)) {
 		for (const value of payload.profiles) {
 			const profile = value as { arn?: unknown };
-			if (typeof profile.arn === "string" && profile.arn) return cacheProfileArn(cacheKey, profile.arn);
+			if (typeof profile.arn === "string" && profile.arn) {
+				return cacheGeneration === kiroProfileArnCacheGeneration
+					? cacheProfileArn(cacheKey, profile.arn)
+					: profile.arn;
+			}
 		}
 	}
 	throw new Error("Kiro profile resolution failed: response contained no profile ARN");
@@ -233,6 +281,25 @@ export interface KiroRequest {
 }
 
 type KiroBlock = (TextContent | ToolCall) & { partialJson?: string };
+
+const KIRO_CONVERSATION_STATE_KEY = "kiro:conversation";
+
+interface KiroConversationState extends ProviderSessionState {
+	conversationId: string;
+}
+
+function kiroConversationId(providerSessionState: Map<string, ProviderSessionState> | undefined): string {
+	const existing = providerSessionState?.get(KIRO_CONVERSATION_STATE_KEY);
+	if (existing && "conversationId" in existing && typeof existing.conversationId === "string") {
+		return existing.conversationId;
+	}
+	const state: KiroConversationState = {
+		conversationId: crypto.randomUUID(),
+		close() {},
+	};
+	providerSessionState?.set(KIRO_CONVERSATION_STATE_KEY, state);
+	return state.conversationId;
+}
 
 /**
  * Kiro's `userInputMessage` wire format carries text only — there is no image
@@ -354,15 +421,23 @@ export function buildKiroRequest(
 	context: Context,
 	profileArn: string,
 	reasoning?: KiroOptions["reasoning"],
+	conversationId: string = crypto.randomUUID(),
 ): KiroRequest {
 	const tools = convertTools(context.tools);
-	const messages = transformMessages(context.messages, model);
-	let current: KiroUserInputMessage;
+	const sourceMessages = [...context.messages];
+	for (const message of sourceMessages) {
+		if (message.role !== "toolResult") continue;
+		for (const block of message.content) {
+			if (block.type === "image") rejectImageContent(block.mimeType);
+		}
+	}
+	const messages = transformMessages(sourceMessages, model);
 	const trailingToolResults: KiroToolResult[] = [];
 	while (messages.at(-1)?.role === "toolResult") {
 		trailingToolResults.unshift(convertToolResult(messages.pop() as ToolResultMessage));
 	}
 	const last = messages.pop();
+	let current: KiroUserInputMessage;
 	if (trailingToolResults.length > 0) {
 		if (last) messages.push(last);
 		current = userInput("", model.id, tools, trailingToolResults);
@@ -376,11 +451,17 @@ export function buildKiroRequest(
 	const history = convertHistory(messages, model.id, tools);
 	const systemPrompt = context.systemPrompt?.filter(Boolean).join("\n\n");
 	if (systemPrompt) {
-		current.content = `<system>\n${systemPrompt}\n</system>\n\n${current.content}`;
+		const prefix = `<system>\n${systemPrompt}\n</system>\n\n`;
+		const firstUserHistory = history.find(
+			(entry): entry is { userInputMessage: KiroUserInputMessage } => "userInputMessage" in entry,
+		);
+		if (firstUserHistory)
+			firstUserHistory.userInputMessage.content = `${prefix}${firstUserHistory.userInputMessage.content}`;
+		else current.content = `${prefix}${current.content}`;
 	}
 	const request: KiroRequest = {
 		conversationState: {
-			conversationId: crypto.randomUUID(),
+			conversationId,
 			history,
 			currentMessage: { userInputMessage: current },
 			chatTriggerType: "MANUAL",
@@ -445,18 +526,50 @@ export const streamKiro: StreamFunction<"kiro-streaming"> = (
 	(async () => {
 		const startedAt = Date.now();
 		let firstTokenAt: number | undefined;
-		let started = false;
 		let activeTextIndex: number | undefined;
 		const toolIndexes = new Map<string, number>();
+		const openToolIds = new Set<string>();
+		const objectInputToolIds = new Set<string>();
+		const finalizeToolCall = (id: string, incomplete: boolean): void => {
+			const index = toolIndexes.get(id);
+			if (index === undefined) return;
+			const block = output.content[index] as KiroBlock | undefined;
+			if (block?.type !== "toolCall") return;
+			const partialJson = block.partialJson;
+			if (partialJson) block.arguments = parseStreamingJson(partialJson) ?? {};
+			const hasObjectInput = objectInputToolIds.has(id);
+			if (partialJson ? !isCompleteJson(partialJson) : incomplete && !hasObjectInput) {
+				block.incompleteArguments = true;
+			}
+			delete block.partialJson;
+			openToolIds.delete(id);
+			objectInputToolIds.delete(id);
+			stream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: output });
+		};
 		try {
 			if (!options.apiKey) throw new Error("Kiro access token is required");
 			const access = parseKiroAccessContext(options.apiKey);
-			const profileArn = options.profileArn ?? access.profileArn ?? (await resolveKiroProfileArn(access.token));
-			const request = buildKiroRequest(model, context, profileArn, options.reasoning);
-			options.onPayload?.(request);
+			const profileArn =
+				options.profileArn ??
+				access.profileArn ??
+				(await resolveKiroProfileArn(access.token, options.fetch, {
+					signal: options.signal,
+					headers: options.headers,
+				}));
+			let request = buildKiroRequest(
+				model,
+				context,
+				profileArn,
+				options.reasoning,
+				kiroConversationId(options.providerSessionState),
+			);
+			const replacementPayload = await options.onPayload?.(request, model);
+			if (replacementPayload !== undefined) request = replacementPayload as KiroRequest;
+			const maxAttempts = resolveRetryBudget(options.requestMaxRetries, 2) + 1;
 			const response = await fetchWithRetry(model.baseUrl || KIRO_RUNTIME_URL, {
 				method: "POST",
 				headers: {
+					...options.headers,
 					Authorization: `Bearer ${access.token}`,
 					"Content-Type": "application/x-amz-json-1.0",
 					"x-amz-target": KIRO_STREAM_TARGET,
@@ -464,20 +577,37 @@ export const streamKiro: StreamFunction<"kiro-streaming"> = (
 					"User-Agent": KIRO_STREAMING_UA,
 					"x-amz-user-agent": KIRO_STREAMING_X_AMZ_UA,
 					"amz-sdk-invocation-id": crypto.randomUUID(),
-					"amz-sdk-request": "attempt=1; max=3",
 					"x-amzn-kiro-agent-mode": "vibe",
 					accept: "*/*",
 					"accept-encoding": "gzip",
 				},
 				body: JSON.stringify(request),
 				signal: options.signal,
+				maxAttempts,
+				maxDelayMs: options.maxRetryDelayMs,
+				fetch: options.fetch,
+				prepareInit: attempt => ({
+					headers: { "amz-sdk-request": `attempt=${attempt + 1}; max=${maxAttempts}` },
+				}),
 			});
+			if (options.onResponse) {
+				const headers = Object.fromEntries(response.headers.entries());
+				await options.onResponse(
+					{
+						status: response.status,
+						headers,
+						requestId: response.headers.get("x-amzn-requestid") ?? response.headers.get("x-amz-request-id"),
+					},
+					model,
+				);
+			}
 			if (!response.ok) {
 				throw Object.assign(new Error(`Kiro ${redactedHttpErrorSummary(response)}`), {
 					status: response.status,
 				});
 			}
 			if (!response.body) throw new Error("Kiro response has no body");
+			stream.push({ type: "start", partial: output });
 
 			for await (const message of decodeEventStream(response.body)) {
 				const messageType = message.headers[":message-type"];
@@ -488,10 +618,6 @@ export const streamKiro: StreamFunction<"kiro-streaming"> = (
 				}
 				if (messageType !== "event") continue;
 				const payload = parsePayload(message.payload);
-				if (!started) {
-					started = true;
-					stream.push({ type: "start", partial: output });
-				}
 				switch (eventType) {
 					case "assistantResponseEvent": {
 						const delta = typeof payload.content === "string" ? payload.content : "";
@@ -510,14 +636,16 @@ export const streamKiro: StreamFunction<"kiro-streaming"> = (
 					case "toolUseEvent": {
 						const id = typeof payload.toolUseId === "string" ? payload.toolUseId : "";
 						if (!id) break;
+						if (toolIndexes.has(id) && !openToolIds.has(id)) {
+							// Ignore a replay after completion without overwriting the first tool call.
+							break;
+						}
 						let index = toolIndexes.get(id);
 						if (index === undefined) {
 							index = output.content.length;
 							const name = typeof payload.name === "string" ? payload.name : "";
-							const initialInput =
-								typeof payload.input === "object" && payload.input !== null
-									? (payload.input as Record<string, unknown>)
-									: {};
+							const hasObjectInput = typeof payload.input === "object" && payload.input !== null;
+							const initialInput = hasObjectInput ? (payload.input as Record<string, unknown>) : {};
 							output.content.push({
 								type: "toolCall",
 								id,
@@ -526,6 +654,8 @@ export const streamKiro: StreamFunction<"kiro-streaming"> = (
 								partialJson: "",
 							} as KiroBlock);
 							toolIndexes.set(id, index);
+							openToolIds.add(id);
+							if (hasObjectInput) objectInputToolIds.add(id);
 							stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
 						}
 						const block = output.content[index] as KiroBlock | undefined;
@@ -535,20 +665,18 @@ export const streamKiro: StreamFunction<"kiro-streaming"> = (
 							block.arguments = parseStreamingJson(block.partialJson) ?? {};
 							stream.push({ type: "toolcall_delta", contentIndex: index, delta, partial: output });
 						}
-						if (payload.stop === true && block?.type === "toolCall") {
-							block.arguments = parseStreamingJson(block.partialJson ?? "") ?? {};
-							delete block.partialJson;
-							stream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: output });
-						}
+						if (payload.stop === true && block?.type === "toolCall") finalizeToolCall(id, false);
 						break;
 					}
 					case "metadataEvent":
-						output.stopReason = mapStopReason(
-							typeof payload.stopReason === "string" ? payload.stopReason : undefined,
-						);
+						if (typeof payload.stopReason === "string") {
+							const nextStopReason = mapStopReason(payload.stopReason);
+							if (output.stopReason === "stop" || nextStopReason !== "stop") output.stopReason = nextStopReason;
+						}
 						break;
 				}
 			}
+			for (const id of [...openToolIds]) finalizeToolCall(id, true);
 
 			if (activeTextIndex !== undefined) {
 				const block = output.content[activeTextIndex];
@@ -564,6 +692,7 @@ export const streamKiro: StreamFunction<"kiro-streaming"> = (
 			stream.push({ type: "done", reason: doneReason, message: output });
 			stream.end();
 		} catch (error) {
+			for (const id of [...openToolIds]) finalizeToolCall(id, true);
 			output.stopReason = options.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = error instanceof Error ? error.message : String(error);
 			output.errorStatus = extractHttpStatusFromError(error);

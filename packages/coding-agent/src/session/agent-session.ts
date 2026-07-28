@@ -3916,10 +3916,12 @@ export class AgentSession {
 			}
 			this.#lastSuccessfulYieldToolCallId = undefined;
 
-			// Check for retryable errors first (overloaded, rate limit, server errors)
-			if (this.#isRetryableError(msg)) {
-				const transportFailure = (msg as AssistantMessage & { transportFailure?: TransportFailureFacts })
-					.transportFailure;
+			// Check retryable failures plus clean auth rejections whose OAuth
+			// credential can be force-refreshed once before surfacing the error.
+			const transportFailure = (msg as AssistantMessage & { transportFailure?: TransportFailureFacts })
+				.transportFailure;
+			const authFailure = classifyFallbackTrigger(transportFailure ?? { status: msg.errorStatus }).class === "auth";
+			if (this.#isRetryableError(msg) || authFailure) {
 				const didRetry = await this.#handleRetryableError(msg, false, transportFailure);
 				if (didRetry) return; // Retry was initiated, don't proceed to compaction
 			}
@@ -13322,8 +13324,13 @@ export class AgentSession {
 		// Prefer the active model's API (the model that produced the error);
 		// the errored message's API is a fallback for the rare case where the
 		// session model has already moved on.
-		const api = this.model?.api ?? message.api;
-		return api === "ollama-chat" || api === "kiro-streaming";
+		const activeApi = this.model?.api;
+		return (
+			activeApi === "ollama-chat" ||
+			activeApi === "kiro-streaming" ||
+			message.api === "ollama-chat" ||
+			message.api === "kiro-streaming"
+		);
 	}
 
 	#isTerminalErrorMessage(errorMessage: string): boolean {
@@ -13772,36 +13779,47 @@ export class AgentSession {
 		// user opt-out.
 		if (!managedFallback && !retrySettings.enabled) return false;
 		const classification = managedFallback ? undefined : this.#classifyErrorForRetry(message);
-		// Bare defaults admit only clean, side-effect-free canonical stream watchdog failures.
-		if (!managedFallback && !legacyRetryConfigured) {
-			if (
-				hasBareDefaultRetryDisqualifyingFacts(message) ||
-				(classification !== "transient" && classification !== "first_event_timeout") ||
-				!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? "") ||
-				!this.#hasCleanRetryReplaySafety
-			) {
-				return false;
-			}
-		}
 		const trigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
 		if (!trigger) {
 			return managedOutcome
 				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
 				: false;
 		}
+		// A supposedly-fresh OAuth token can be revoked early by a peer refresh.
+		// Recover one clean auth failure by refreshing/rotating the exact credential;
+		// the retry counter makes this strictly one-shot under bare defaults.
+		const credentialRecovered =
+			!managedFallback &&
+			trigger.class === "auth" &&
+			this.#retryAttempt === 0 &&
+			message.content.length === 0 &&
+			(await this.#markFailedManagedCredential(trigger));
+		// Bare defaults admit only clean, side-effect-free canonical stream watchdog failures.
+		if (!managedFallback && !legacyRetryConfigured) {
+			if (
+				!credentialRecovered &&
+				(hasBareDefaultRetryDisqualifyingFacts(message) ||
+					(classification !== "transient" && classification !== "first_event_timeout") ||
+					!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? "") ||
+					!this.#hasCleanRetryReplaySafety)
+			) {
+				return false;
+			}
+		}
 		const legacyUnbounded = classification === "transient";
 		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome = managedFallback
 			? controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error")
-			: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
+			: credentialRecovered || legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
 				? "retry"
 				: "exhausted";
 		const credentialRotated =
-			managedFallback &&
-			outcome === "advance" &&
-			(trigger.class === "quota" || trigger.class === "rate_limit") &&
-			(await this.#markFailedManagedCredential(trigger));
+			credentialRecovered ||
+			(managedFallback &&
+				outcome === "advance" &&
+				(trigger.class === "quota" || trigger.class === "rate_limit") &&
+				(await this.#markFailedManagedCredential(trigger)));
 		if (credentialRotated && controller.restorePreviousEntryForRetry()) {
 			outcome = "retry";
 		}

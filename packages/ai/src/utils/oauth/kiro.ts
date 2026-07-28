@@ -30,7 +30,7 @@
 
 import { Database } from "bun:sqlite";
 import { scheduler } from "node:timers/promises";
-import { getAgentDbPath, logger } from "@gajae-code/utils";
+import { getAgentDbPath } from "@gajae-code/utils";
 import { KIRO_BUILDER_ID_PROFILE_ARN } from "../../providers/kiro";
 import { redactedHttpErrorSummary } from "../http-error-redaction";
 import type { KiroLoginMethod, OAuthCredentials } from "./types";
@@ -157,14 +157,9 @@ async function readRegistration(): Promise<KiroDeviceRegistration | undefined> {
 }
 
 function writeRegistration(registration: KiroDeviceRegistration): void {
-	let db: Database;
+	const db = new Database(getAgentDbPath());
 	try {
-		db = new Database(getAgentDbPath());
-	} catch (error) {
-		logger.warn("Kiro device registration store not writable", { error: String(error) });
-		return;
-	}
-	try {
+		db.run("PRAGMA busy_timeout=5000");
 		// `auth-storage.ts` #initializeSchema owns this table, but that store may
 		// not have been opened in this process yet, so keep the idempotent create.
 		db.run("CREATE TABLE IF NOT EXISTS kiro_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
@@ -530,17 +525,26 @@ export async function refreshKiroSocialToken(
 		body: JSON.stringify({ refreshToken: credentials.refresh }),
 		signal: AbortSignal.timeout(TOKEN_REQUEST_TIMEOUT_MS),
 	});
-	if (!response.ok) throw new Error(`Kiro social token refresh failed: ${response.status}`);
+	if (!response.ok) throw new Error(`Kiro social token refresh failed: ${redactedHttpErrorSummary(response)}`);
 	const payload = (await response.json()) as SocialRefreshResponse;
 	const access = assertString(payload.accessToken, "accessToken");
 	const refresh = typeof payload.refreshToken === "string" ? payload.refreshToken : credentials.refresh;
-	const profileArn =
-		typeof payload.profileArn === "string" && payload.profileArn
-			? payload.profileArn
-			: assertString(credentials.kiroProfileArn, "profileArn");
-	const expiresInSec = typeof payload.expiresIn === "number" ? payload.expiresIn : 28800;
+	const refreshedProfileArn =
+		typeof payload.profileArn === "string" && payload.profileArn ? payload.profileArn : undefined;
+	if (credentials.kiroProfileArn && refreshedProfileArn && credentials.kiroProfileArn !== refreshedProfileArn) {
+		throw new Error("Kiro social token refresh failed: profile ARN changed");
+	}
+	const profileArn = refreshedProfileArn ?? credentials.kiroProfileArn;
+	const expiresInSec = typeof payload.expiresIn === "number" && payload.expiresIn > 0 ? payload.expiresIn : 28800;
 	const expires = Date.now() + expiresInSec * 1000 - OAUTH_EXPIRY_SKEW_MS;
-	return { ...credentials, access, refresh, expires, kiroMethod: method, kiroProfileArn: profileArn };
+	return {
+		...credentials,
+		access,
+		refresh,
+		expires,
+		kiroMethod: method,
+		...(profileArn ? { kiroProfileArn: profileArn } : {}),
+	};
 }
 
 /**

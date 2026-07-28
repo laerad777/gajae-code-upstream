@@ -189,7 +189,7 @@ describe("resolveLazyStreamFirstEventFallbackMs", () => {
 	it("returns 300s for slow-first-event providers without a configured fallback", () => {
 		expect(resolveLazyStreamFirstEventFallbackMs("alibaba-token-plan")).toBe(300_000);
 		expect(resolveLazyStreamFirstEventFallbackMs("kimi-code")).toBe(300_000);
-		expect(resolveLazyStreamFirstEventFallbackMs("kiro")).toBe(300_000);
+		expect(resolveLazyStreamFirstEventFallbackMs("kiro")).toBeUndefined();
 	});
 	it("returns undefined for unrelated providers", () => {
 		expect(resolveLazyStreamFirstEventFallbackMs("openai")).toBeUndefined();
@@ -204,6 +204,12 @@ describe("resolveLazyStreamFirstEventFallbackMs", () => {
 });
 
 describe("kiro lazy-stream idle floor", () => {
+	it("owns the first-event floor at the wrapper level for aliased providers", () => {
+		expect(KIRO_LAZY_STREAM_LIMITS.defaultFirstEventTimeoutMs).toBe(300_000);
+		expect(
+			resolveLazyStreamFirstEventFallbackMs("kiro-alias", KIRO_LAZY_STREAM_LIMITS.defaultFirstEventTimeoutMs),
+		).toBe(300_000);
+	});
 	it("widens the steady-state idle watchdog to the first-event floor", () => {
 		expect(getStreamIdleTimeoutMs(KIRO_LAZY_STREAM_LIMITS.defaultIdleTimeoutMs)).toBe(300_000);
 	});

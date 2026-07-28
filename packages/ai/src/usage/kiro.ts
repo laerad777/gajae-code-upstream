@@ -290,7 +290,9 @@ async function fetchKiroUsage(params: UsageFetchParams, ctx: UsageFetchContext):
 			label: breakdownLabel(breakdown, index),
 			scope: {
 				provider: params.provider,
-				accountId: credential.accountId ?? accountLabel,
+				accountId:
+					credential.accountId ??
+					(credential.credentialId !== undefined ? `credential:${credential.credentialId}` : accountLabel),
 				tier: subscriptionTitle,
 				windowId: "billing-cycle",
 				shared: true,

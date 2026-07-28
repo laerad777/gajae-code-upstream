@@ -34,11 +34,11 @@ export interface KiroDiscoveryOptions {
 export async function fetchKiroModels(options: KiroDiscoveryOptions): Promise<Model<"kiro-streaming">[] | null> {
 	if (!options.accessToken.trim()) return null;
 	const fetcher = options.fetcher ?? fetch;
-	const profileArn = options.profileArn?.trim() || (await resolveKiroProfileArn(options.accessToken, fetcher));
-	const url = new URL(KIRO_MANAGEMENT_URL);
-	url.searchParams.set("origin", KIRO_ORIGIN);
-	url.searchParams.set("profileArn", profileArn);
 	try {
+		const profileArn = options.profileArn?.trim() || (await resolveKiroProfileArn(options.accessToken, fetcher));
+		const url = new URL(KIRO_MANAGEMENT_URL);
+		url.searchParams.set("origin", KIRO_ORIGIN);
+		url.searchParams.set("profileArn", profileArn);
 		const response = await fetcher(url, {
 			method: "POST",
 			headers: {
@@ -57,16 +57,27 @@ export async function fetchKiroModels(options: KiroDiscoveryOptions): Promise<Mo
 		if (!response.ok) return null;
 		const payload = (await response.json()) as KiroModelsPayload;
 		if (!Array.isArray(payload.models)) return null;
+		const seenModelIds = new Set<string>();
 		return payload.models.flatMap(value => {
 			const model = value as KiroModelPayload;
 			if (typeof model.modelId !== "string" || !model.modelId) return [];
+			if (seenModelIds.has(model.modelId)) return [];
+			seenModelIds.add(model.modelId);
 			const maxInput =
 				typeof model.tokenLimits?.maxInputTokens === "number" ? model.tokenLimits.maxInputTokens : 200_000;
 			const maxOutput =
 				typeof model.tokenLimits?.maxOutputTokens === "number" ? model.tokenLimits.maxOutputTokens : 64_000;
-			const schemaStr = JSON.stringify(model.additionalModelRequestFieldsSchema ?? {});
-			const hasThinking = schemaStr.includes('"thinking"');
-			const hasReasoning = schemaStr.includes('"reasoning"');
+			const schema = model.additionalModelRequestFieldsSchema;
+			const properties =
+				typeof schema === "object" &&
+				schema !== null &&
+				"properties" in schema &&
+				typeof schema.properties === "object" &&
+				schema.properties !== null
+					? schema.properties
+					: {};
+			const hasThinking = "thinking" in properties;
+			const hasReasoning = "reasoning" in properties;
 			// Kiro's `userInputMessage` wire format is text-only.
 			return [
 				{

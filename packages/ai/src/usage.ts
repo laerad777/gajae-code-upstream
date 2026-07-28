@@ -140,6 +140,8 @@ export interface UsageCredential {
 	accountId?: string;
 	projectId?: string;
 	email?: string;
+	/** Stable row id from the credential store; never sent to providers. */
+	credentialId?: number;
 	enterpriseUrl?: string;
 	kiroMethod?: "builder-id" | "google" | "github";
 	kiroProfileArn?: string;
