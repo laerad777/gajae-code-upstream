@@ -126,21 +126,21 @@ describe("usage report column ordering", () => {
 		// Every Builder ID credential carries Kiro CLI's single hardcoded profile
 		// ARN, so two Builder ID accounts derive the same label. Grouping on the
 		// label would merge their independent balances into one column pair.
-		const builderId = (fraction: number): UsageReport =>
-			({
-				provider: "kiro",
-				fetchedAt: NOW,
-				metadata: { account: "kiro builder-id" },
-				limits: [
-					{
-						label: "Credits",
-						status: "ok",
-						amount: { usedFraction: fraction, unit: "requests" },
-						scope: { provider: "kiro", windowId: "billing-cycle" },
-						window: { id: "billing-cycle", label: "Billing cycle", resetsAt: NOW + 86_400_000 },
-					},
-				],
-			}) as UsageReport;
+		const builderId = (fraction: number): UsageReport => ({
+			provider: "kiro",
+			fetchedAt: NOW,
+			metadata: { account: "kiro builder-id" },
+			limits: [
+				{
+					id: "kiro:credit",
+					label: "Credits",
+					status: "ok",
+					amount: { usedFraction: fraction, unit: "requests" },
+					scope: { provider: "kiro", windowId: "billing-cycle" },
+					window: { id: "billing-cycle", label: "Billing cycle", resetsAt: NOW + 86_400_000 },
+				},
+			],
+		});
 
 		const lines = stripAnsi(renderUsageReports([builderId(0.1), builderId(0.9)], theme, NOW, 100)).split("\n");
 		const headers = lines.filter(line => line.includes("kiro builder-id"));

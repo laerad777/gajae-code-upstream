@@ -9,9 +9,9 @@ import {
 	streamBedrock,
 } from "../src/providers/register-builtins";
 import { stream as streamModel } from "../src/stream";
-import { getStreamIdleTimeoutMs } from "../src/utils/idle-iterator";
 import type { AssistantMessage, Context, Model } from "../src/types";
 import type { AssistantMessageEventStream } from "../src/utils/event-stream";
+import { getStreamIdleTimeoutMs } from "../src/utils/idle-iterator";
 
 function createModel(): Model<"bedrock-converse-stream"> {
 	return {
