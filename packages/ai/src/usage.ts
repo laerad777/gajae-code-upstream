@@ -141,6 +141,8 @@ export interface UsageCredential {
 	projectId?: string;
 	email?: string;
 	enterpriseUrl?: string;
+	kiroMethod?: "builder-id" | "google" | "github";
+	kiroProfileArn?: string;
 	metadata?: Record<string, unknown>;
 }
 
@@ -154,7 +156,7 @@ export interface UsageFetchParams {
 
 /** Shared runtime utilities for fetchers. */
 export interface UsageFetchContext {
-	fetch: typeof fetch;
+	fetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;
 	logger?: UsageLogger;
 	retryWait?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
 }
