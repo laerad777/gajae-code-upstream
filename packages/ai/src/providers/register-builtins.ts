@@ -201,6 +201,19 @@ const GOOGLE_GEMINI_CLI_LAZY_STREAM_LIMITS: LazyStreamLimits = {
 const SLOW_FIRST_EVENT_PROVIDERS = new Set(["alibaba-token-plan", "kimi-code", "kiro"]);
 
 /**
+ * Kiro's steady-state gaps are as slow as its cold start. The same reasoning
+ * tiers go silent between tokens for longer than the shared 120s idle floor
+ * while the upstream plans a tool call, so the watchdog aborted mid-response
+ * with `Provider stream stalled while waiting for the next event`. That abort
+ * is only auto-retried when the turn is still replay-safe, so a stall after a
+ * tool call surfaced as a hard failure instead of recovering. Widen the idle
+ * floor to match the five-minute first-event floor above.
+ */
+export const KIRO_LAZY_STREAM_LIMITS: LazyStreamLimits = {
+	defaultIdleTimeoutMs: 300_000,
+};
+
+/**
  * Resolves the first-event timeout fallback for the outer lazy-stream watchdog.
  * A configured wrapper-specific fallback (from `LazyStreamLimits`) always wins;
  * otherwise providers known to have slow first events get a five-minute floor
@@ -441,6 +454,6 @@ export const streamOpenAICompletions = createLazyStream(loadOpenAICompletionsPro
 export const streamOpenAIResponses = createLazyStream(loadOpenAIResponsesProviderModule);
 export const streamCursor = createLazyStream(loadCursorProviderModule);
 export const streamOllama = createLazyStream(loadOllamaProviderModule);
-export const streamKiro = createLazyStream(loadKiroProviderModule);
+export const streamKiro = createLazyStream(loadKiroProviderModule, KIRO_LAZY_STREAM_LIMITS);
 
 export const streamBedrock = createLazyStream(loadBedrockProviderModule);

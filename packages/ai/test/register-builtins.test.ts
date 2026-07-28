@@ -3,11 +3,13 @@ import "../src/providers/openai-completions";
 import "../src/providers/openai-responses";
 import { getBundledModel } from "../src/models";
 import {
+	KIRO_LAZY_STREAM_LIMITS,
 	resolveLazyStreamFirstEventFallbackMs,
 	setBedrockProviderModule,
 	streamBedrock,
 } from "../src/providers/register-builtins";
 import { stream as streamModel } from "../src/stream";
+import { getStreamIdleTimeoutMs } from "../src/utils/idle-iterator";
 import type { AssistantMessage, Context, Model } from "../src/types";
 import type { AssistantMessageEventStream } from "../src/utils/event-stream";
 
@@ -198,6 +200,15 @@ describe("resolveLazyStreamFirstEventFallbackMs", () => {
 		expect(resolveLazyStreamFirstEventFallbackMs("kimi-code", 42_000)).toBe(42_000);
 		expect(resolveLazyStreamFirstEventFallbackMs("kiro", 42_000)).toBe(42_000);
 		expect(resolveLazyStreamFirstEventFallbackMs("google-gemini-cli", 300_000)).toBe(300_000);
+	});
+});
+
+describe("kiro lazy-stream idle floor", () => {
+	it("widens the steady-state idle watchdog to the first-event floor", () => {
+		expect(getStreamIdleTimeoutMs(KIRO_LAZY_STREAM_LIMITS.defaultIdleTimeoutMs)).toBe(300_000);
+	});
+	it("leaves the shared idle default untouched for other providers", () => {
+		expect(getStreamIdleTimeoutMs()).toBe(120_000);
 	});
 });
 
