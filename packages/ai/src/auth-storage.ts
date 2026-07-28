@@ -29,6 +29,7 @@ import { githubCopilotUsageProvider } from "./usage/github-copilot";
 import { antigravityUsageProvider } from "./usage/google-antigravity";
 import { grokCliRankingStrategy, grokCliUsageProvider } from "./usage/grok-cli";
 import { kimiUsageProvider } from "./usage/kimi";
+import { kiroUsageProvider } from "./usage/kiro";
 import { codexRankingStrategy, openaiCodexUsageProvider } from "./usage/openai-codex";
 import { zaiUsageProvider } from "./usage/zai";
 import { getOAuthApiKey, getOAuthProvider, refreshOAuthToken, resolveOAuthStorageProvider } from "./utils/oauth";
@@ -530,6 +531,7 @@ const DEFAULT_USAGE_PROVIDERS: UsageProvider[] = [
 	zaiUsageProvider,
 	githubCopilotUsageProvider,
 	grokCliUsageProvider,
+	kiroUsageProvider,
 ];
 
 const DEFAULT_USAGE_PROVIDER_MAP = new Map<Provider, UsageProvider>(
@@ -2074,6 +2076,8 @@ export class AuthStorage {
 			projectId: credential.projectId,
 			email: credential.email,
 			enterpriseUrl: credential.enterpriseUrl,
+			kiroMethod: credential.kiroMethod,
+			kiroProfileArn: credential.kiroProfileArn,
 		};
 	}
 
@@ -2148,6 +2152,8 @@ export class AuthStorage {
 			projectId: credential.projectId,
 			email: credential.email,
 			enterpriseUrl: credential.enterpriseUrl,
+			kiroMethod: credential.kiroMethod,
+			kiroProfileArn: credential.kiroProfileArn,
 		};
 	}
 
@@ -2161,6 +2167,8 @@ export class AuthStorage {
 			projectId: refreshed.projectId ?? credential.projectId,
 			email: refreshed.email ?? credential.email,
 			enterpriseUrl: refreshed.enterpriseUrl ?? credential.enterpriseUrl,
+			kiroMethod: refreshed.kiroMethod ?? credential.kiroMethod,
+			kiroProfileArn: refreshed.kiroProfileArn ?? credential.kiroProfileArn,
 		};
 	}
 
@@ -2208,6 +2216,8 @@ export class AuthStorage {
 			projectId: next.projectId,
 			email: next.email,
 			enterpriseUrl: next.enterpriseUrl,
+			kiroMethod: next.kiroMethod ?? existing.kiroMethod,
+			kiroProfileArn: next.kiroProfileArn ?? existing.kiroProfileArn,
 		});
 	}
 
@@ -3309,6 +3319,8 @@ export class AuthStorage {
 			}
 			if (!result) return undefined;
 			const updated: OAuthCredential = {
+				// Preserve provider-specific routing fields across refresh.
+				...selection.credential,
 				type: "oauth",
 				access: result.newCredentials.access,
 				refresh: result.newCredentials.refresh,
@@ -3317,6 +3329,8 @@ export class AuthStorage {
 				email: result.newCredentials.email ?? selection.credential.email,
 				projectId: result.newCredentials.projectId ?? selection.credential.projectId,
 				enterpriseUrl: result.newCredentials.enterpriseUrl ?? selection.credential.enterpriseUrl,
+				kiroMethod: result.newCredentials.kiroMethod ?? selection.credential.kiroMethod,
+				kiroProfileArn: result.newCredentials.kiroProfileArn ?? selection.credential.kiroProfileArn,
 			};
 			this.#replaceCredentialAt(provider, selection.index, updated);
 			if ((checkUsage && !allowBlocked) || requiresProModel) {
@@ -4158,6 +4172,11 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				expires_at INTEGER NOT NULL
 			);
 			CREATE INDEX IF NOT EXISTS idx_cache_expires ON cache(expires_at);
+			-- Additive shared storage for Kiro's long-lived device registration.
+			CREATE TABLE IF NOT EXISTS kiro_kv (
+				key TEXT PRIMARY KEY,
+				value TEXT NOT NULL
+			);
 		`);
 
 		if (!this.#authCredentialsTableExists()) {

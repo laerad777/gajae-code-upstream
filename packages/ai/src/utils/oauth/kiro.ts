@@ -7,8 +7,17 @@
  *   (RegisterClient → StartDeviceAuthorization → polled CreateToken) against
  *   `oidc.us-east-1.amazonaws.com`. The dynamically-registered client
  *   (clientId/clientSecret) must outlive the access token so refresh works, so
- *   it is persisted in the agent DB, mirroring Kiro CLI's
- *   `kirocli:odic:device-registration` keychain entry.
+ *   it is persisted in the agent DB under the `kiro_kv` table (schema owned by
+ *   `auth-storage.ts` `#initializeSchema`), keyed the same way Kiro CLI names
+ *   its `kirocli:odic:device-registration` entry.
+ *
+ *   At-rest protection is **not** OS-keychain equivalent: Kiro CLI stores that
+ *   entry in the platform keychain, whereas this row is plaintext JSON in
+ *   SQLite. That matches how `auth-storage.ts` `serializeCredential` already
+ *   persists every OAuth credential (plaintext `JSON.stringify`) in the same
+ *   database file — there is no encryption layer in this store to route into —
+ *   so the client secret inherits exactly the `auth_credentials` protection
+ *   level and no more. It carries a ~90-day lifetime.
  * - Google / GitHub: Kiro's own desktop auth service device flow
  *   (`/oauth/device/authorization` → polled `/oauth/device/poll` →
  *   `/refreshToken`) against `prod.us-east-1.auth.desktop.kiro.dev`. The poll
@@ -21,7 +30,8 @@
 
 import { Database } from "bun:sqlite";
 import { scheduler } from "node:timers/promises";
-import { getAgentDbPath } from "@gajae-code/utils";
+import { getAgentDbPath, logger } from "@gajae-code/utils";
+import { redactedHttpErrorSummary } from "../http-error-redaction";
 import type { KiroLoginMethod, OAuthCredentials } from "./types";
 
 const OIDC_ENDPOINT = "https://oidc.us-east-1.amazonaws.com";
@@ -46,7 +56,6 @@ const KIRO_SOCIAL_DEVICE_POLL_URL = "https://prod.us-east-1.auth.desktop.kiro.de
 const KIRO_SOCIAL_CLIENT_ID = "kiro-cli";
 /** `loginProvider` values the desktop auth service accepts. */
 const KIRO_SOCIAL_LOGIN_PROVIDERS = { google: "Google", github: "Github" } as const;
-const KIRO_MANAGEMENT_URL = "https://management.us-east-1.kiro.dev/";
 
 function kiroPlatform(): string {
 	switch (process.platform) {
@@ -87,25 +96,50 @@ export interface KiroDeviceRegistration {
 	clientSecretExpiresAt: number;
 }
 
-function readRegistration(): KiroDeviceRegistration | undefined {
+/**
+ * Read the persisted device registration. A missing database, table, or row is
+ * an expected cold-start state; all other storage and validation failures fail
+ * closed.
+ */
+async function readRegistration(): Promise<KiroDeviceRegistration | undefined> {
+	const dbPath = getAgentDbPath();
+	if (!(await Bun.file(dbPath).exists())) return undefined;
+
 	let db: Database;
 	try {
-		db = new Database(getAgentDbPath(), { readonly: true });
+		db = new Database(dbPath, { readonly: true });
 	} catch {
-		return undefined;
+		throw new Error("Kiro device registration store could not be opened");
 	}
 	try {
+		const table = db
+			.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'kiro_kv'")
+			.get() as { present?: number } | undefined;
+		if (table?.present !== 1) return undefined;
+
 		const row = db.prepare("SELECT value FROM kiro_kv WHERE key = ?").get(REGISTRATION_KEY) as
 			| { value?: string }
+			| null
 			| undefined;
-		if (typeof row?.value !== "string") return undefined;
-		const parsed = JSON.parse(row.value) as Partial<KiroDeviceRegistration>;
+		if (row == null) return undefined;
+		if (typeof row.value !== "string") throw new Error("Kiro device registration is invalid");
+
+		let parsed: Partial<KiroDeviceRegistration>;
+		try {
+			parsed = JSON.parse(row.value) as Partial<KiroDeviceRegistration>;
+		} catch {
+			throw new Error("Kiro device registration is invalid");
+		}
+		if (parsed === null || typeof parsed !== "object") throw new Error("Kiro device registration is invalid");
 		if (
 			typeof parsed.clientId !== "string" ||
+			parsed.clientId.length === 0 ||
 			typeof parsed.clientSecret !== "string" ||
-			typeof parsed.clientSecretExpiresAt !== "number"
+			parsed.clientSecret.length === 0 ||
+			typeof parsed.clientSecretExpiresAt !== "number" ||
+			!Number.isFinite(parsed.clientSecretExpiresAt)
 		) {
-			return undefined;
+			throw new Error("Kiro device registration is invalid");
 		}
 		return {
 			clientId: parsed.clientId,
@@ -113,8 +147,9 @@ function readRegistration(): KiroDeviceRegistration | undefined {
 			clientIdIssuedAt: typeof parsed.clientIdIssuedAt === "number" ? parsed.clientIdIssuedAt : 0,
 			clientSecretExpiresAt: parsed.clientSecretExpiresAt,
 		};
-	} catch {
-		return undefined;
+	} catch (error) {
+		if (error instanceof Error && error.message === "Kiro device registration is invalid") throw error;
+		throw new Error("Kiro device registration could not be read");
 	} finally {
 		db.close();
 	}
@@ -124,11 +159,14 @@ function writeRegistration(registration: KiroDeviceRegistration): void {
 	let db: Database;
 	try {
 		db = new Database(getAgentDbPath());
-	} catch {
+	} catch (error) {
+		logger.warn("Kiro device registration store not writable", { error: String(error) });
 		return;
 	}
 	try {
-		db.run("CREATE TABLE IF NOT EXISTS kiro_kv (key TEXT PRIMARY KEY, value TEXT)");
+		// `auth-storage.ts` #initializeSchema owns this table, but that store may
+		// not have been opened in this process yet, so keep the idempotent create.
+		db.run("CREATE TABLE IF NOT EXISTS kiro_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
 		db.prepare("INSERT OR REPLACE INTO kiro_kv (key, value) VALUES (?, ?)").run(
 			REGISTRATION_KEY,
 			JSON.stringify(registration),
@@ -202,7 +240,7 @@ async function registerClient(signal?: AbortSignal): Promise<KiroDeviceRegistrat
 		signal: requestSignal(signal),
 	});
 	if (!response.ok) {
-		throw new Error(`Kiro RegisterClient failed: ${response.status} ${await response.text()}`);
+		throw new Error(`Kiro RegisterClient failed: ${redactedHttpErrorSummary(response)}`);
 	}
 	const payload = (await response.json()) as RegisterClientResponse;
 	const clientId = assertString(payload.clientId, "clientId");
@@ -232,7 +270,7 @@ async function startDeviceAuthorization(
 		signal: requestSignal(signal),
 	});
 	if (!response.ok) {
-		throw new Error(`Kiro StartDeviceAuthorization failed: ${response.status} ${await response.text()}`);
+		throw new Error(`Kiro StartDeviceAuthorization failed: ${redactedHttpErrorSummary(response)}`);
 	}
 	return (await response.json()) as DeviceAuthorizationResponse;
 }
@@ -322,7 +360,7 @@ export async function loginKiro(options: KiroLoginOptions): Promise<OAuthCredent
 		return loginKiroSocial(method, options);
 	}
 	options.onProgress?.(`Registering Kiro client (${method})…`);
-	let registration = readRegistration();
+	let registration = await readRegistration();
 	if (!isRegistrationValid(registration)) {
 		registration = await registerClient(options.signal);
 	}
@@ -343,38 +381,11 @@ export async function loginKiro(options: KiroLoginOptions): Promise<OAuthCredent
 	const credentials = await pollForToken(registration, deviceCode, interval, expiresIn, options.signal);
 	options.onProgress?.("Logged in to Kiro.");
 
-	// Resolve profile ARN for ALL methods (not just social).  The profile
-	// determines model entitlements — Builder ID gets a different profile
-	// than Google/GitHub.  Storing it avoids wrong-profile requests later.
-	const profileArn = await resolveProfileArn(credentials.access);
-	return { ...credentials, kiroMethod: method, kiroProfileArn: profileArn };
-}
-
-async function resolveProfileArn(accessToken: string): Promise<string | undefined> {
-	try {
-		const response = await fetch(KIRO_MANAGEMENT_URL, {
-			method: "POST",
-			headers: {
-				Authorization: `Bearer ${accessToken}`,
-				"Content-Type": "application/x-amz-json-1.0",
-				"x-amz-target": "AmazonCodeWhispererService.ListAvailableProfiles",
-				"User-Agent": KIRO_KIROCLI_UA,
-				"accept-encoding": "gzip",
-			},
-			body: "{}",
-			signal: AbortSignal.timeout(TOKEN_REQUEST_TIMEOUT_MS),
-		});
-		if (!response.ok) return undefined;
-		const payload = (await response.json()) as { profiles?: Array<{ arn?: unknown }> };
-		if (Array.isArray(payload.profiles)) {
-			for (const profile of payload.profiles) {
-				if (typeof profile.arn === "string" && profile.arn) return profile.arn;
-			}
-		}
-	} catch {
-		// Best-effort; streaming resolves lazily.
-	}
-	return undefined;
+	// Builder ID has no server-supplied profile ARN; usage resolves it on first use.
+	return {
+		...credentials,
+		kiroMethod: method,
+	};
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -421,7 +432,7 @@ async function startKiroSocialDeviceAuthorization(
 		signal: requestSignal(signal),
 	});
 	if (!response.ok) {
-		throw new Error(`Kiro social device authorization failed: ${response.status} ${await response.text()}`);
+		throw new Error(`Kiro social device authorization failed: ${redactedHttpErrorSummary(response)}`);
 	}
 	return (await response.json()) as KiroSocialDeviceAuthResponse;
 }
@@ -434,7 +445,7 @@ async function pollKiroSocialDevice(deviceCode: string, signal?: AbortSignal): P
 		signal: requestSignal(signal),
 	});
 	if (!response.ok) {
-		throw new Error(`Kiro social device poll failed: ${response.status} ${await response.text()}`);
+		throw new Error(`Kiro social device poll failed: ${redactedHttpErrorSummary(response)}`);
 	}
 	return (await response.json()) as KiroSocialPollResponse;
 }
@@ -469,7 +480,7 @@ async function loginKiroSocial(method: "google" | "github", options: KiroLoginOp
 		const status = typeof poll.status === "string" ? poll.status : "";
 		if (typeof poll.accessToken === "string" && poll.accessToken) {
 			options.onProgress?.("Logged in to Kiro.");
-			const profileArn = typeof poll.profileArn === "string" && poll.profileArn ? poll.profileArn : undefined;
+			const profileArn = assertString(poll.profileArn, "profileArn");
 			return {
 				access: poll.accessToken,
 				refresh: assertString(poll.refreshToken, "refreshToken"),
@@ -477,7 +488,7 @@ async function loginKiroSocial(method: "google" | "github", options: KiroLoginOp
 				// reports 8h, so mirror that and let refresh correct it.
 				expires: Date.now() + 28800 * 1000 - OAUTH_EXPIRY_SKEW_MS,
 				kiroMethod: method,
-				...(profileArn ? { kiroProfileArn: profileArn } : {}),
+				kiroProfileArn: profileArn,
 			};
 		}
 		if (status === "authorization_pending") continue;
@@ -519,7 +530,10 @@ export async function refreshKiroSocialToken(
 	const payload = (await response.json()) as SocialRefreshResponse;
 	const access = assertString(payload.accessToken, "accessToken");
 	const refresh = typeof payload.refreshToken === "string" ? payload.refreshToken : credentials.refresh;
-	const profileArn = typeof payload.profileArn === "string" ? payload.profileArn : credentials.kiroProfileArn;
+	const profileArn =
+		typeof payload.profileArn === "string" && payload.profileArn
+			? payload.profileArn
+			: assertString(credentials.kiroProfileArn, "profileArn");
 	const expiresInSec = typeof payload.expiresIn === "number" ? payload.expiresIn : 28800;
 	const expires = Date.now() + expiresInSec * 1000 - OAUTH_EXPIRY_SKEW_MS;
 	return { ...credentials, access, refresh, expires, kiroMethod: method, kiroProfileArn: profileArn };
@@ -531,7 +545,7 @@ export async function refreshKiroSocialToken(
  * (~90-day lifetime); otherwise the user must re-run `/login kiro`.
  */
 export async function refreshKiroToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-	const registration = readRegistration();
+	const registration = await readRegistration();
 	if (!isRegistrationValid(registration)) {
 		throw new Error("Kiro client registration is missing or expired — run /login kiro again.");
 	}
@@ -545,9 +559,12 @@ export async function refreshKiroToken(credentials: OAuthCredentials): Promise<O
 		throw new Error(`Kiro token refresh failed: ${error}${description ? `: ${description}` : ""}`);
 	}
 	const expiresInToken = typeof token.expiresIn === "number" ? token.expiresIn : 28800;
+	// Preserve Kiro routing metadata from the incoming credential.
 	return {
+		...credentials,
 		access: assertString(token.accessToken, "accessToken"),
 		refresh: assertString(token.refreshToken ?? credentials.refresh, "refreshToken"),
 		expires: Date.now() + expiresInToken * 1000 - OAUTH_EXPIRY_SKEW_MS,
+		kiroMethod: credentials.kiroMethod ?? "builder-id",
 	};
 }
