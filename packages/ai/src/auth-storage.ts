@@ -721,8 +721,15 @@ function raceCredentialRefreshWithSignal<T>(
 	message = "credential refresh aborted",
 ): Promise<T> {
 	if (!signal) return promise;
-	if (signal.aborted) return Promise.reject(new Error(message));
+	if (signal.aborted) {
+		// A single-flight operation may already be running even though this waiter
+		// is cancelled. Observe its eventual rejection before returning the
+		// waiter's immediate abort error so Bun/Node cannot report it as unhandled.
+		void promise.catch(() => {});
+		return Promise.reject(new Error(message));
+	}
 	const abort = Promise.withResolvers<never>();
+	void abort.promise.catch(() => {});
 	const onAbort = (): void => abort.reject(new Error(message));
 	signal.addEventListener("abort", onAbort, { once: true });
 	return Promise.race([promise, abort.promise]).finally(() => {
@@ -3084,7 +3091,7 @@ export class AuthStorage {
 						type: "oauth",
 					};
 					candidate.selection.credential = updated;
-					this.#replaceCredentialAt(provider, candidate.selection.index, updated);
+					if (credentialId === undefined) this.#replaceCredentialAt(provider, candidate.selection.index, updated);
 				} catch {}
 			}),
 		);
@@ -3137,13 +3144,27 @@ export class AuthStorage {
 			const existing = this.#oauthCredentialRefreshInFlight.get(credentialId);
 			if (existing) return raceCredentialRefreshWithSignal(existing, signal);
 		}
+		if (signal?.aborted) throw new Error("credential refresh aborted");
 		if (Date.now() + OAUTH_REFRESH_SKEW_MS < credential.expires) return credential;
 		if (credentialId === undefined) {
 			return this.#refreshOAuthCredentialUnshared(provider, credential, undefined, signal);
 		}
-		const promise = this.#refreshOAuthCredentialUnshared(provider, credential, credentialId).finally(() => {
-			this.#oauthCredentialRefreshInFlight.delete(credentialId);
-		});
+		const promise = this.#refreshOAuthCredentialUnshared(provider, credential, credentialId)
+			.then(refreshed => {
+				// Persist inside the shared operation, not in a caller's continuation.
+				// Every waiter may cancel, but a successful rotating-token response must
+				// still replace the stored refresh token before this promise settles.
+				const entries = this.#getStoredCredentials(provider);
+				const index = entries.findIndex(entry => entry.id === credentialId);
+				const current = index >= 0 ? entries[index]?.credential : undefined;
+				if (current?.type === "oauth") {
+					this.#replaceCredentialAt(provider, index, { ...current, ...refreshed, type: "oauth" });
+				}
+				return refreshed;
+			})
+			.finally(() => {
+				this.#oauthCredentialRefreshInFlight.delete(credentialId);
+			});
 		this.#oauthCredentialRefreshInFlight.set(credentialId, promise);
 		return raceCredentialRefreshWithSignal(promise, signal);
 	}
@@ -3154,49 +3175,59 @@ export class AuthStorage {
 		credentialId: number | undefined,
 		signal?: AbortSignal,
 	): Promise<OAuthCredentials> {
-		let refreshPromise: Promise<OAuthCredentials>;
-		// Caller override > store-level hook > local per-provider refresh.
-		// `RemoteAuthCredentialStore` exposes the hook so a broker-backed gateway
-		// routes refresh through the broker without explicit wiring.
-		const storeRefresh = this.#store.refreshOAuthCredential?.bind(this.#store);
-		const overrideRefresh = this.#refreshOAuthCredentialOverride ?? storeRefresh;
-		if (overrideRefresh && credentialId !== undefined) {
-			refreshPromise = overrideRefresh(provider, credentialId, credential, signal);
-		} else if (credential.mcpBinding) {
-			refreshPromise = refreshBoundMCPOAuthCredential(credential, {}, signal);
-		} else {
-			const customProvider = getOAuthProvider(provider);
-			if (customProvider) {
-				if (!customProvider.refreshToken) {
-					throw new Error(`OAuth provider "${provider}" does not support token refresh`);
-				}
-				refreshPromise = customProvider.refreshToken(credential);
-			} else {
-				refreshPromise = refreshOAuthToken(provider as OAuthProvider, credential);
-			}
-		}
-		// Bound the refresh so a slow/hanging token endpoint cannot stall credential selection.
-		// Caller-driven abort jumps the gun on the timeout — the agent's ESC must
-		// take priority over the floor timeout.
-		let timeout: NodeJS.Timeout | undefined;
-		let onAbort: (() => void) | undefined;
+		// One transport signal owns both the caller cancellation and the hard
+		// refresh deadline. A wrapper-only Promise.race is unsafe for providers
+		// that rotate refresh tokens: the HTTP request could succeed after the
+		// caller has abandoned it, leaving the replacement token unpersisted.
+		const transportController = new AbortController();
 		const cancellation = Promise.withResolvers<never>();
-		timeout = setTimeout(
-			() => cancellation.reject(new Error(`OAuth token refresh timed out for provider: ${provider}`)),
+		// The caller signal may already be aborted before Promise.race is wired.
+		// Mark the internal rejection handled immediately; the original promise
+		// still rejects the race with the same error.
+		void cancellation.promise.catch(() => {});
+		const cancelTransport = (error: Error): void => {
+			if (!transportController.signal.aborted) transportController.abort(error);
+			cancellation.reject(error);
+		};
+		const timeout = setTimeout(
+			() => cancelTransport(new Error(`OAuth token refresh timed out for provider: ${provider}`)),
 			DEFAULT_OAUTH_REFRESH_TIMEOUT_MS,
 		);
+		let onAbort: (() => void) | undefined;
 		if (signal) {
 			if (signal.aborted) {
-				cancellation.reject(new Error("OAuth token refresh aborted by caller"));
+				cancelTransport(new Error("OAuth token refresh aborted by caller"));
 			} else {
-				onAbort = () => cancellation.reject(new Error("OAuth token refresh aborted by caller"));
+				onAbort = () => cancelTransport(new Error("OAuth token refresh aborted by caller"));
 				signal.addEventListener("abort", onAbort, { once: true });
 			}
 		}
+
 		try {
+			let refreshPromise: Promise<OAuthCredentials>;
+			// Caller override > store-level hook > local per-provider refresh.
+			// `RemoteAuthCredentialStore` exposes the hook so a broker-backed gateway
+			// routes refresh through the broker without explicit wiring.
+			const storeRefresh = this.#store.refreshOAuthCredential?.bind(this.#store);
+			const overrideRefresh = this.#refreshOAuthCredentialOverride ?? storeRefresh;
+			if (overrideRefresh && credentialId !== undefined) {
+				refreshPromise = overrideRefresh(provider, credentialId, credential, transportController.signal);
+			} else if (credential.mcpBinding) {
+				refreshPromise = refreshBoundMCPOAuthCredential(credential, {}, transportController.signal);
+			} else {
+				const customProvider = getOAuthProvider(provider);
+				if (customProvider) {
+					if (!customProvider.refreshToken) {
+						throw new Error(`OAuth provider "${provider}" does not support token refresh`);
+					}
+					refreshPromise = customProvider.refreshToken(credential);
+				} else {
+					refreshPromise = refreshOAuthToken(provider as OAuthProvider, credential, transportController.signal);
+				}
+			}
 			return await Promise.race([refreshPromise, cancellation.promise]);
 		} finally {
-			if (timeout) clearTimeout(timeout);
+			clearTimeout(timeout);
 			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
 		}
 	}
@@ -3290,12 +3321,13 @@ export class AuthStorage {
 
 		try {
 			let result: { newCredentials: OAuthCredentials; apiKey: string } | null;
+			const credentialId = this.#getStoredCredentials(provider)[selection.index]?.id;
 			const customProvider = getOAuthProvider(provider);
 			if (customProvider) {
 				const refreshedCredentials = await this.#refreshOAuthCredential(
 					provider,
 					selection.credential,
-					this.#getStoredCredentials(provider)[selection.index]?.id,
+					credentialId,
 					options?.signal,
 				);
 				const apiKey = customProvider.getApiKey
@@ -3311,7 +3343,7 @@ export class AuthStorage {
 				const refreshedCredentials = await this.#refreshOAuthCredential(
 					provider,
 					selection.credential,
-					this.#getStoredCredentials(provider)[selection.index]?.id,
+					credentialId,
 					options?.signal,
 				);
 				const oauthCreds: Record<string, OAuthCredentials> = {
@@ -3334,7 +3366,7 @@ export class AuthStorage {
 				kiroMethod: result.newCredentials.kiroMethod ?? selection.credential.kiroMethod,
 				kiroProfileArn: result.newCredentials.kiroProfileArn ?? selection.credential.kiroProfileArn,
 			};
-			this.#replaceCredentialAt(provider, selection.index, updated);
+			if (credentialId === undefined) this.#replaceCredentialAt(provider, selection.index, updated);
 			if ((checkUsage && !allowBlocked) || requiresProModel) {
 				const sameAccount = selection.credential.accountId === updated.accountId;
 				if (!usageChecked || !sameAccount) {
@@ -3361,6 +3393,13 @@ export class AuthStorage {
 			return { apiKey: result.apiKey, credential: updated };
 		} catch (error) {
 			const errorMsg = String(error);
+			if (options?.signal?.aborted) {
+				logger.debug("OAuth refresh waiter cancelled without penalizing credential", {
+					provider,
+					index: selection.index,
+				});
+				return undefined;
+			}
 			// Peer-rotation recovery runs before ANY failure classification: a
 			// concurrent process may have rotated the refresh token, which
 			// invalidates the snapshot token we just attempted. Re-read the row —

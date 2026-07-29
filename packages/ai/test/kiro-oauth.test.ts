@@ -1,12 +1,12 @@
 import { Database } from "bun:sqlite";
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, mock, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDbPath, getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { AuthStorage } from "../src/auth-storage";
 import { KIRO_BUILDER_ID_PROFILE_ARN } from "../src/providers/kiro";
-import { getOAuthApiKey } from "../src/utils/oauth";
+import { getOAuthApiKey, refreshOAuthToken } from "../src/utils/oauth";
 import { loginKiro, refreshKiroSocialToken, refreshKiroToken } from "../src/utils/oauth/kiro";
 
 const REGISTRATION_KEY = "kirocli:odic:device-registration";
@@ -101,6 +101,7 @@ function stubFetch(handler: (request: Request) => Promise<Response>): Request[] 
 }
 
 afterEach(async () => {
+	vi.useRealTimers();
 	if (previousFetch) {
 		globalThis.fetch = previousFetch;
 		previousFetch = undefined;
@@ -561,6 +562,143 @@ describe("Kiro OAuth error redaction adoption", () => {
 });
 
 describe("Kiro social refresh resilience", () => {
+	test("propagates caller cancellation through refreshOAuthToken to the Kiro fetch", async () => {
+		const controller = new AbortController();
+		const started = Promise.withResolvers<void>();
+		let requestSignal: AbortSignal | undefined;
+		stubFetch(async request => {
+			requestSignal = request.signal;
+			started.resolve();
+			await new Promise<void>(resolve => {
+				controller.signal.addEventListener("abort", () => queueMicrotask(resolve), { once: true });
+			});
+			if (request.signal.aborted) throw new Error("transport aborted");
+			return Response.json({ accessToken: "should-not-complete", refreshToken: "rotated-after-cancel" });
+		});
+
+		const refreshing = refreshOAuthToken(
+			"kiro",
+			{
+				access: "old-access",
+				refresh: "old-refresh",
+				expires: 1,
+				kiroMethod: "google",
+			},
+			controller.signal,
+		);
+		await started.promise;
+		controller.abort(new Error("caller cancelled"));
+
+		await expect(refreshing).rejects.toThrow("transport aborted");
+		expect(requestSignal?.aborted).toBe(true);
+	});
+
+	test("persists a rotated Kiro token when the caller stops waiting", async () => {
+		await useTempAgentDir();
+		const profileArn = "arn:aws:codewhisperer:us-east-1:123456789012:profile/social-cancel";
+		const storage = await AuthStorage.create(getAgentDbPath());
+		const controller = new AbortController();
+		const started = Promise.withResolvers<void>();
+		const finishRefresh = Promise.withResolvers<void>();
+		let requestSignal: AbortSignal | undefined;
+		try {
+			await storage.set("kiro", [
+				{
+					type: "oauth",
+					access: "expired-access",
+					refresh: "rotating-refresh",
+					expires: Date.now() - 60_000,
+					kiroMethod: "google",
+					kiroProfileArn: profileArn,
+				},
+			]);
+			stubFetch(async request => {
+				requestSignal = request.signal;
+				started.resolve();
+				await finishRefresh.promise;
+				return Response.json({
+					accessToken: "rotated-access",
+					refreshToken: "rotated-after-cancel",
+					expiresIn: 28_800,
+					profileArn,
+				});
+			});
+
+			const keyPromise = storage.getApiKey("kiro", "cancelled-refresh", { signal: controller.signal });
+			await started.promise;
+			controller.abort();
+			await keyPromise.catch(() => undefined);
+
+			expect(requestSignal?.aborted).toBe(false);
+			finishRefresh.resolve();
+
+			let persistedRefresh = "";
+			for (let attempt = 0; attempt < 50 && persistedRefresh !== "rotated-after-cancel"; attempt += 1) {
+				const db = new Database(getAgentDbPath(), { readonly: true });
+				try {
+					const row = db.prepare("SELECT data FROM auth_credentials WHERE provider = ?").get("kiro") as {
+						data: string;
+					};
+					persistedRefresh = (JSON.parse(row.data) as { refresh?: string }).refresh ?? "";
+				} finally {
+					db.close();
+				}
+				if (persistedRefresh !== "rotated-after-cancel") await Bun.sleep(5);
+			}
+			expect(persistedRefresh).toBe("rotated-after-cancel");
+			const nextKey = await storage.getApiKey("kiro", "after-cancel");
+			if (!nextKey) throw new Error("rotated credential was not immediately selectable");
+			expect((JSON.parse(nextKey) as { token?: string }).token).toBe("rotated-access");
+		} finally {
+			finishRefresh.resolve();
+			storage.close();
+		}
+	});
+
+	test("aborts the shared Kiro refresh transport at the AuthStorage deadline", async () => {
+		await useTempAgentDir();
+		const storage = await AuthStorage.create(getAgentDbPath());
+		const controller = new AbortController();
+		const started = Promise.withResolvers<void>();
+		let requestSignal: AbortSignal | undefined;
+		try {
+			await storage.set("kiro", [
+				{
+					type: "oauth",
+					access: "expired-access",
+					refresh: "rotating-refresh",
+					expires: Date.now() - 60_000,
+					kiroMethod: "google",
+				},
+			]);
+			stubFetch(async request => {
+				requestSignal = request.signal;
+				started.resolve();
+				await new Promise<never>((_resolve, reject) => {
+					request.signal.addEventListener("abort", () => reject(new Error("transport deadline abort")), {
+						once: true,
+					});
+				});
+				throw new Error("unreachable");
+			});
+
+			vi.useFakeTimers();
+			const keyPromise = storage.getApiKey("kiro", "deadline-refresh", { signal: controller.signal });
+			await started.promise;
+			vi.advanceTimersByTime(10_000);
+			await Promise.resolve();
+			await Promise.resolve();
+
+			expect(requestSignal?.aborted).toBe(true);
+			controller.abort();
+			vi.useRealTimers();
+			await keyPromise.catch(() => undefined);
+		} finally {
+			vi.useRealTimers();
+			storage.close();
+		}
+	});
+
 	test("force-refreshes a supposedly fresh social credential after an upstream auth rejection", async () => {
 		await useTempAgentDir();
 		const profileArn = "arn:aws:codewhisperer:us-east-1:123456789012:profile/social-test";

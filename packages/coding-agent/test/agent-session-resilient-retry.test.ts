@@ -934,7 +934,7 @@ describe("AgentSession resilient retry", () => {
 		}
 	});
 
-	it("refreshes and retries one rejected OAuth credential under bare defaults", async () => {
+	it("invalidates and retries one rejected Kiro runtime credential under bare defaults", async () => {
 		const kiroModel: Model<"kiro-streaming"> = {
 			id: "claude-sonnet-4.6",
 			name: "claude-sonnet-4.6",

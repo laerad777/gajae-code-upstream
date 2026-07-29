@@ -282,6 +282,153 @@ describe("AuthStorage OAuth refresh race", () => {
 		await expect(second).resolves.toBe("access-rotated");
 		expect(refreshCalls).toBe(1);
 	});
+
+	test("keeps a shared refresh alive when one waiter cancels", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		const refreshedExpires = Date.now() + 60 * 60_000;
+		const refreshStarted = Promise.withResolvers<void>();
+		const allowRefresh = Promise.withResolvers<void>();
+		const controller = new AbortController();
+		let refreshCalls = 0;
+
+		oauthUtils.registerOAuthProvider({
+			id: "unit-oauth-cancelled-waiter",
+			name: "Unit OAuth Cancelled Waiter",
+			sourceId: "auth-storage-oauth-refresh-race-test",
+			async login() {
+				return { access: "unused", refresh: "unused", expires: refreshedExpires };
+			},
+			async refreshToken(credentials) {
+				refreshCalls += 1;
+				refreshStarted.resolve();
+				await allowRefresh.promise;
+				return {
+					...credentials,
+					access: "access-rotated",
+					refresh: "refresh-rotated",
+					expires: refreshedExpires,
+				};
+			},
+			getApiKey(credentials) {
+				return credentials.access;
+			},
+		});
+
+		await authStorage.set("unit-oauth-cancelled-waiter", [
+			{ type: "oauth", access: "access-old", refresh: "refresh-old", expires: Date.now() - 60_000 },
+		]);
+
+		const cancelled = authStorage.getApiKey("unit-oauth-cancelled-waiter", "cancelled", {
+			signal: controller.signal,
+		});
+		const waiting = authStorage.getApiKey("unit-oauth-cancelled-waiter", "waiting");
+		await refreshStarted.promise;
+		controller.abort();
+		await expect(cancelled).resolves.toBeUndefined();
+		allowRefresh.resolve();
+
+		await expect(waiting).resolves.toBe("access-rotated");
+		expect(refreshCalls).toBe(1);
+		const persisted = store.listAuthCredentials("unit-oauth-cancelled-waiter")[0]?.credential;
+		expect(persisted?.type).toBe("oauth");
+		if (persisted?.type === "oauth") expect(persisted.refresh).toBe("refresh-rotated");
+	});
+
+	test("persists a shared rotation after every waiter cancels", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const refreshedExpires = Date.now() + 60 * 60_000;
+		const refreshStarted = Promise.withResolvers<void>();
+		const allowRefresh = Promise.withResolvers<void>();
+		const firstController = new AbortController();
+		const secondController = new AbortController();
+		let refreshCalls = 0;
+
+		oauthUtils.registerOAuthProvider({
+			id: "unit-oauth-all-waiters-cancelled",
+			name: "Unit OAuth All Waiters Cancelled",
+			sourceId: "auth-storage-oauth-refresh-race-test",
+			async login() {
+				return { access: "unused", refresh: "unused", expires: refreshedExpires };
+			},
+			async refreshToken(credentials) {
+				refreshCalls += 1;
+				refreshStarted.resolve();
+				await allowRefresh.promise;
+				return {
+					...credentials,
+					access: "access-after-all-cancelled",
+					refresh: "refresh-after-all-cancelled",
+					expires: refreshedExpires,
+				};
+			},
+			getApiKey(credentials) {
+				return credentials.access;
+			},
+		});
+
+		await authStorage.set("unit-oauth-all-waiters-cancelled", [
+			{ type: "oauth", access: "access-old", refresh: "refresh-old", expires: Date.now() - 60_000 },
+		]);
+		const first = authStorage.getApiKey("unit-oauth-all-waiters-cancelled", "cancelled-first", {
+			signal: firstController.signal,
+		});
+		const second = authStorage.getApiKey("unit-oauth-all-waiters-cancelled", "cancelled-second", {
+			signal: secondController.signal,
+		});
+		await refreshStarted.promise;
+		firstController.abort();
+		secondController.abort();
+		await expect(first).resolves.toBeUndefined();
+		await expect(second).resolves.toBeUndefined();
+
+		allowRefresh.resolve();
+		let persistedRefresh: string | undefined;
+		for (let attempt = 0; attempt < 50; attempt++) {
+			const persisted = store.listAuthCredentials("unit-oauth-all-waiters-cancelled")[0]?.credential;
+			if (persisted?.type === "oauth") persistedRefresh = persisted.refresh;
+			if (persistedRefresh === "refresh-after-all-cancelled") break;
+			await Bun.sleep(5);
+		}
+
+		expect(refreshCalls).toBe(1);
+		expect(persistedRefresh).toBe("refresh-after-all-cancelled");
+	});
+
+	test("persists one successful shared refresh exactly once", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const update = vi.spyOn(store, "updateAuthCredential");
+		const refreshedExpires = Date.now() + 60 * 60_000;
+
+		oauthUtils.registerOAuthProvider({
+			id: "unit-oauth-single-persist",
+			name: "Unit OAuth Single Persist",
+			sourceId: "auth-storage-oauth-refresh-race-test",
+			async login() {
+				return { access: "unused", refresh: "unused", expires: refreshedExpires };
+			},
+			async refreshToken(credentials) {
+				return {
+					...credentials,
+					access: "access-rotated",
+					refresh: "refresh-rotated",
+					expires: refreshedExpires,
+				};
+			},
+			getApiKey(credentials) {
+				return credentials.access;
+			},
+		});
+
+		await authStorage.set("unit-oauth-single-persist", [
+			{ type: "oauth", access: "access-old", refresh: "refresh-old", expires: Date.now() - 60_000 },
+		]);
+		await expect(authStorage.getApiKey("unit-oauth-single-persist", "single-persist")).resolves.toBe(
+			"access-rotated",
+		);
+
+		expect(update).toHaveBeenCalledTimes(1);
+	});
 	test("invalidating a session-sticky OAuth credential rotates the retry to another active credential", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 
