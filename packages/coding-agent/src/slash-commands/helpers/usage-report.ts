@@ -1,4 +1,5 @@
 import type { UsageLimit, UsageReport } from "@gajae-code/ai";
+import { replaceTabs, truncateToWidth } from "../../tools/render-utils";
 import type { SlashCommandRuntime } from "../types";
 import { formatDuration, renderAsciiBar } from "./format";
 
@@ -21,11 +22,40 @@ function formatUsageAmount(limit: UsageLimit): string {
 	return `${usedText}${remainingText}`;
 }
 
+function reportMetadataString(report: UsageReport, key: string): string | undefined {
+	const value = report.metadata?.[key];
+	if (typeof value !== "string") return undefined;
+	const sanitized = replaceTabs(value)
+		.replaceAll(/[\r\n\u0000-\u001f\u007f]+/g, " ")
+		.trim();
+	return sanitized ? truncateToWidth(sanitized, 160) : undefined;
+}
+
+function isInternalCredentialLabel(report: UsageReport, value: string | undefined): boolean {
+	return report.provider === "kiro" && typeof value === "string" && /^credential:/i.test(value.trim());
+}
+
 function formatUsageReportAccount(report: UsageReport, limit: UsageLimit, index: number): string {
-	const email = report.metadata?.email;
-	if (typeof email === "string" && email) return email;
-	const accountId = report.metadata?.accountId ?? limit.scope.accountId;
-	if (typeof accountId === "string" && accountId) return accountId;
+	const email = reportMetadataString(report, "email");
+	if (email && !isInternalCredentialLabel(report, email)) return email;
+	const accountId = reportMetadataString(report, "accountId");
+	const account = reportMetadataString(report, "account");
+	if (report.provider === "kiro" && account && !isInternalCredentialLabel(report, account)) return account;
+	if (accountId && !isInternalCredentialLabel(report, accountId)) return accountId;
+	const scopeAccountId = limit.scope.accountId;
+	if (scopeAccountId && !isInternalCredentialLabel(report, scopeAccountId)) return scopeAccountId;
+	if (account && !isInternalCredentialLabel(report, account)) return account;
+	return `account ${index + 1}`;
+}
+
+function formatUnlimitedUsageReportAccount(report: UsageReport, index: number): string {
+	const email = reportMetadataString(report, "email");
+	if (email && !isInternalCredentialLabel(report, email)) return email;
+	const accountId = reportMetadataString(report, "accountId");
+	const account = reportMetadataString(report, "account");
+	if (report.provider === "kiro" && account && !isInternalCredentialLabel(report, account)) return account;
+	if (accountId && !isInternalCredentialLabel(report, accountId)) return accountId;
+	if (account && !isInternalCredentialLabel(report, account)) return account;
 	return `account ${index + 1}`;
 }
 
@@ -43,10 +73,17 @@ function renderUsageReports(reports: UsageReport[], nowMs: number): string {
 		left.localeCompare(right),
 	)) {
 		lines.push("", formatProviderName(provider));
-		for (const report of providerReports) {
+		for (let reportIndex = 0; reportIndex < providerReports.length; reportIndex++) {
+			const report = providerReports[reportIndex]!;
 			if (report.limits.length === 0) {
-				const email = typeof report.metadata?.email === "string" ? report.metadata.email : "account";
-				lines.push(`- ${email}: no limits reported`);
+				const account = formatUnlimitedUsageReportAccount(report, reportIndex);
+				const reason = reportMetadataString(report, "unavailableReason");
+				lines.push(
+					truncateToWidth(
+						reason ? `- ${account}: unavailable — ${reason}` : `- ${account}: no limits reported`,
+						240,
+					),
+				);
 				continue;
 			}
 			for (let index = 0; index < report.limits.length; index++) {

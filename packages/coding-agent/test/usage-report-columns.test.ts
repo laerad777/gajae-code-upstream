@@ -60,8 +60,8 @@ describe("usage report column ordering", () => {
 		}
 	});
 
-	test("renders Kiro subscription balances as separate account rows", () => {
-		const kiroReport = (account: string, fraction: number): UsageReport => ({
+	test("renders Kiro subscription balances with derived account labels instead of credential ids", () => {
+		const kiroReport = (account: string, credentialId: number, fraction: number): UsageReport => ({
 			provider: "kiro",
 			fetchedAt: NOW,
 			metadata: { account, subscriptionTitle: "KIRO PRO MAX" },
@@ -73,7 +73,7 @@ describe("usage report column ordering", () => {
 					amount: { usedFraction: fraction, unit: "requests" },
 					scope: {
 						provider: "kiro",
-						accountId: account,
+						accountId: `credential:${credentialId}`,
 						tier: "KIRO PRO MAX",
 						windowId: "billing-cycle",
 					},
@@ -83,7 +83,12 @@ describe("usage report column ordering", () => {
 		});
 
 		const output = stripAnsi(
-			renderUsageReports([kiroReport("kiro builder-id", 0.2), kiroReport("kiro github", 0.4)], theme, NOW, 100),
+			renderUsageReports(
+				[kiroReport("kiro builder-id", 21, 0.2), kiroReport("kiro github", 26, 0.4)],
+				theme,
+				NOW,
+				100,
+			),
 		);
 		const lines = output.split("\n");
 
@@ -91,6 +96,7 @@ describe("usage report column ordering", () => {
 		expect(lines.some(line => line.includes("kiro builder-id"))).toBe(true);
 		expect(lines.some(line => line.includes("kiro github"))).toBe(true);
 		expect(lines.some(line => line.includes("kiro builder-id") && line.includes("kiro github"))).toBe(false);
+		expect(output).not.toContain("credential:");
 	});
 	test("renders unavailable Kiro accounts as separate error rows", () => {
 		const reports: UsageReport[] = [
