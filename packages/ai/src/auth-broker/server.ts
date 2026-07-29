@@ -553,7 +553,10 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						// Drop the `raw` field — it's the provider-specific upstream body,
 						// large and unstable. Everything UI-relevant lives in `limits` and
 						// `metadata`.
-						const trimmed = reports.map(({ raw: _raw, ...rest }) => rest);
+						const trimmed = reports.map(({ raw: _raw, metadata, ...rest }) => {
+							const { accountIdentity: _accountIdentity, ...publicMetadata } = metadata ?? {};
+							return { ...rest, metadata: publicMetadata };
+						});
 						logger.info("auth-broker usage served", { peer, reports: trimmed.length });
 						return json(200, { generatedAt: Date.now(), reports: trimmed });
 					} catch (error) {

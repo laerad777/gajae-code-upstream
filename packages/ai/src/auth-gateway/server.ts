@@ -747,7 +747,10 @@ async function handleUsage(storage: AuthStorage, signal: AbortSignal): Promise<R
 	// Drop the heavy provider-specific `raw` payload — UI consumers only need
 	// `limits` + `metadata`. Match the broker's `/v1/usage` shape so a single
 	// client struct (Swift widget, llm-git, ...) works against either endpoint.
-	const trimmed = reports.map(({ raw: _raw, ...rest }) => rest);
+	const trimmed = reports.map(({ raw: _raw, metadata, ...rest }) => {
+		const { accountIdentity: _accountIdentity, ...publicMetadata } = metadata ?? {};
+		return { ...rest, metadata: publicMetadata };
+	});
 	return json(200, { generatedAt: Date.now(), reports: trimmed });
 }
 

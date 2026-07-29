@@ -284,6 +284,34 @@ describe("Kiro usage provider", () => {
 		expect(report?.limits[0]?.scope.accountId).toBe("kiro github (PROPLUS)");
 	});
 
+	test("uses a collision-resistant hidden identity for same-method social accounts", async () => {
+		const fetchFor = (userId: string): UsageFetchContext => ({
+			fetch: async (): Promise<Response> =>
+				Response.json({ userInfo: { userId }, usageBreakdownList: [usageBreakdown()] }),
+		});
+		const firstUserId = "kiro-collision-46568";
+		const secondUserId = "kiro-collision-98821";
+
+		const first = await kiroUsageProvider.fetchUsage(
+			usageParams({ expiresAt: Date.now() + 600_000, kiroMethod: "google" }),
+			fetchFor(firstUserId),
+		);
+		const second = await kiroUsageProvider.fetchUsage(
+			usageParams({ expiresAt: Date.now() + 600_000, kiroMethod: "google" }),
+			fetchFor(secondUserId),
+		);
+
+		const firstLabel = first?.metadata?.account;
+		const secondLabel = second?.metadata?.account;
+		expect(firstLabel).toStartWith("kiro google (user-");
+		expect(secondLabel).toStartWith("kiro google (user-");
+		expect(firstLabel).not.toBe(secondLabel);
+		expect(first?.metadata?.accountIdentity).not.toBe(second?.metadata?.accountIdentity);
+		expect(String(first?.metadata?.accountIdentity)).toHaveLength("kiro-user:".length + 64);
+		expect(JSON.stringify(first)).not.toContain(firstUserId);
+		expect(JSON.stringify(second)).not.toContain(secondUserId);
+	});
+
 	test("falls back to the profile suffix when the login method is absent", async () => {
 		const ctx: UsageFetchContext = {
 			fetch: async (): Promise<Response> => Response.json({ usageBreakdownList: [usageBreakdown()] }),
@@ -336,7 +364,7 @@ describe("Kiro usage provider", () => {
 		};
 
 		const report = await kiroUsageProvider.fetchUsage(
-			usageParams({ expiresAt: Date.now() + 600_000, kiroMethod: "google" }),
+			usageParams({ expiresAt: Date.now() + 600_000, kiroMethod: "google", credentialId: 44 }),
 			ctx,
 		);
 
@@ -345,6 +373,7 @@ describe("Kiro usage provider", () => {
 		expect(report).not.toBeNull();
 		expect(report?.limits).toEqual([]);
 		expect(report?.metadata?.account).toBe("kiro google (PROPLUS)");
+		expect(report?.metadata?.accountIdentity).toBe("kiro-credential:44");
 		expect(report?.metadata?.unavailableReason).toBe("GetUsageLimits returned HTTP 400");
 	});
 
