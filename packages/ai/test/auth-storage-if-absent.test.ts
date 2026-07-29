@@ -356,8 +356,12 @@ try {
 				const initial = await storage.importCredentialIfAbsent("anthropic", oauth("cached"));
 				expect(initial.reason).toBe("inserted");
 
-				const cacheKey =
-					"usage_cache:report:anthropic:default:oauth|account:acct-cached|email:user-cached@example.com";
+				const identity = JSON.stringify({
+					type: "oauth",
+					accountId: "acct-cached",
+					email: "user-cached@example.com",
+				});
+				const cacheKey = `usage_cache:report:${JSON.stringify("anthropic")}:${JSON.stringify(["default", identity])}`;
 				store.setCache(
 					cacheKey,
 					JSON.stringify({

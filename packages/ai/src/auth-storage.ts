@@ -306,6 +306,12 @@ export interface AuthCredentialStore {
 	close(): void;
 	listAuthCredentials(provider?: string): StoredAuthCredential[];
 	updateAuthCredential(id: number, credential: AuthCredential): void;
+	tryUpdateAuthCredentialIfMatches?(
+		id: number,
+		expectedData: string,
+		credential: AuthCredential,
+		provider: string,
+	): boolean;
 	deleteAuthCredential(id: number, disabledCause: string): void;
 	tryDisableAuthCredentialIfMatches(id: number, expectedData: string, disabledCause: string): boolean;
 	replaceAuthCredentialsForProvider(provider: string, credentials: AuthCredential[]): StoredAuthCredential[];
@@ -1242,6 +1248,13 @@ export class AuthStorage {
 		this.#credentialBackoff.set(providerKey, backoffMap);
 	}
 
+	#clearCredentialBlocked(providerKey: string, credentialIndex: number): void {
+		const backoffMap = this.#credentialBackoff.get(providerKey);
+		if (!backoffMap) return;
+		backoffMap.delete(credentialIndex);
+		if (backoffMap.size === 0) this.#credentialBackoff.delete(providerKey);
+	}
+
 	/** Records which credential was used for a session (for rate-limit switching). */
 	#recordSessionCredential(
 		provider: string,
@@ -1409,6 +1422,32 @@ export class AuthStorage {
 		this.#setStoredCredentials(provider, updated);
 	}
 
+	#tryReplaceCredentialAtIfMatches(
+		provider: string,
+		credentialId: number,
+		expectedCredential: AuthCredential,
+		credential: AuthCredential,
+	): boolean {
+		const expected = serializeCredential(provider, expectedCredential);
+		if (!expected) return false;
+		const compareAndSwap = this.#store.tryUpdateAuthCredentialIfMatches?.bind(this.#store);
+		if (compareAndSwap) {
+			if (!compareAndSwap(credentialId, expected.data, credential, provider)) return false;
+		} else {
+			const persisted = this.#store.listAuthCredentials(provider).find(entry => entry.id === credentialId);
+			const serialized = persisted ? serializeCredential(provider, persisted.credential) : undefined;
+			if (!serialized || serialized.data !== expected.data) return false;
+			this.#store.updateAuthCredential(credentialId, credential);
+		}
+		const entries = this.#getStoredCredentials(provider);
+		const index = entries.findIndex(entry => entry.id === credentialId);
+		if (index === -1) return false;
+		const updated = [...entries];
+		updated[index] = { id: credentialId, credential };
+		this.#setStoredCredentials(provider, updated);
+		return true;
+	}
+
 	/**
 	 * CAS-style disable used when OAuth refresh definitively fails: only disables
 	 * persisted `data` still matches the credential we attempted to refresh.
@@ -1564,7 +1603,7 @@ export class AuthStorage {
 	#invalidateUsageCacheForProvider(provider: string): void {
 		this.#usageRequestInFlight.clear();
 		this.#usageReportsInFlight.clear();
-		this.#usageCache.deletePrefix?.(`report:${provider}:`);
+		this.#usageCache.deletePrefix?.(`report:${JSON.stringify(provider)}:`);
 	}
 
 	/**
@@ -2090,28 +2129,25 @@ export class AuthStorage {
 	}
 
 	#buildUsageCacheIdentity(credential: UsageCredential): string {
-		const parts: string[] = [credential.type];
 		const accountId = credential.accountId?.trim();
-		if (accountId) parts.push(`account:${accountId}`);
 		const email = credential.email?.trim().toLowerCase();
-		if (email) parts.push(`email:${email}`);
 		const projectId = credential.projectId?.trim();
-		if (projectId) parts.push(`project:${projectId}`);
 		const enterpriseUrl = credential.enterpriseUrl?.trim().toLowerCase();
-		if (enterpriseUrl) parts.push(`enterprise:${enterpriseUrl}`);
-		// Only fall back to a secret-derived key when a stable account identifier is unavailable.
-		// Including the token hash when accountId/email are present causes cache misses on
-		// every OAuth refresh — usage data is per-account, not per-token.
-		const hasStableIdentifier = Boolean(accountId || email);
-		if (!hasStableIdentifier) {
-			const secret = credential.apiKey?.trim() || credential.refreshToken?.trim() || credential.accessToken?.trim();
-			if (secret) {
-				parts.push(`secret:${Bun.hash(secret).toString(16)}`);
-			} else {
-				parts.push("anonymous");
-			}
-		}
-		return parts.join("|");
+		const hasStableIdentifier = Boolean(accountId || email || projectId || enterpriseUrl);
+		const fallback = hasStableIdentifier
+			? undefined
+			: credential.credentialId !== undefined
+				? { kind: "credential", value: credential.credentialId }
+				: {
+						kind: "secret",
+						value: Bun.hash(
+							credential.apiKey?.trim() ||
+								credential.refreshToken?.trim() ||
+								credential.accessToken?.trim() ||
+								"anonymous",
+						).toString(16),
+					};
+		return JSON.stringify({ type: credential.type, accountId, email, projectId, enterpriseUrl, fallback });
 	}
 
 	#normalizeUsageBaseUrl(baseUrl?: string): string {
@@ -2121,14 +2157,17 @@ export class AuthStorage {
 	#buildUsageReportCacheKey(request: UsageRequestDescriptor): string {
 		const baseUrl = this.#normalizeUsageBaseUrl(request.baseUrl) || "default";
 		const identity = this.#buildUsageCacheIdentity(request.credential);
-		return `report:${request.provider}:${baseUrl}:${identity}`;
+		return `report:${JSON.stringify(request.provider)}:${JSON.stringify([baseUrl, identity])}`;
 	}
 
 	#buildUsageReportsCacheKey(requests: ReadonlyArray<UsageRequestDescriptor>): string {
 		const snapshot = requests
-			.map(
-				request =>
-					`${request.provider}:${this.#normalizeUsageBaseUrl(request.baseUrl) || "default"}:${this.#buildUsageCacheIdentity(request.credential)}`,
+			.map(request =>
+				JSON.stringify([
+					request.provider,
+					this.#normalizeUsageBaseUrl(request.baseUrl) || "default",
+					this.#buildUsageCacheIdentity(request.credential),
+				]),
 			)
 			.sort()
 			.join("\n");
@@ -2188,11 +2227,17 @@ export class AuthStorage {
 	 */
 	#findStoredCredentialIdForUsageCredential(provider: Provider, previous: UsageCredential): number | undefined {
 		const entries = this.#getStoredCredentials(provider);
+		if (previous.credentialId !== undefined) {
+			const byId = entries.find(entry => entry.id === previous.credentialId && entry.credential.type === "oauth");
+			return byId?.id;
+		}
+		const hasIdentity = Boolean(previous.accountId || previous.email || previous.projectId);
 		const match = entries.find(entry => {
 			if (entry.credential.type !== "oauth") return false;
 			if (previous.refreshToken && entry.credential.refresh === previous.refreshToken) return true;
 			if (previous.accessToken && entry.credential.access === previous.accessToken) return true;
 			return (
+				hasIdentity &&
 				entry.credential.accountId === previous.accountId &&
 				entry.credential.email === previous.email &&
 				entry.credential.projectId === previous.projectId
@@ -2203,11 +2248,14 @@ export class AuthStorage {
 
 	#persistRefreshedUsageCredential(provider: Provider, previous: UsageCredential, next: UsageCredential): void {
 		const entries = this.#getStoredCredentials(provider);
+		const hasIdentity = Boolean(previous.accountId || previous.email || previous.projectId);
 		const index = entries.findIndex(entry => {
 			if (entry.credential.type !== "oauth") return false;
+			if (previous.credentialId !== undefined) return entry.id === previous.credentialId;
 			if (previous.refreshToken && entry.credential.refresh === previous.refreshToken) return true;
 			if (previous.accessToken && entry.credential.access === previous.accessToken) return true;
 			return (
+				hasIdentity &&
 				entry.credential.accountId === previous.accountId &&
 				entry.credential.email === previous.email &&
 				entry.credential.projectId === previous.projectId
@@ -2421,6 +2469,12 @@ export class AuthStorage {
 		if (email) identifiers.push(`email:${email.toLowerCase()}`);
 		if (report.provider === "openai-codex" || report.provider === "anthropic") {
 			return identifiers.map(identifier => `${report.provider}:${identifier.toLowerCase()}`);
+		}
+		if (report.provider === "kiro") {
+			const accountIdentity = this.#getUsageReportMetadataValue(report, "accountIdentity");
+			if (accountIdentity) return [`kiro:identity:${accountIdentity.toLowerCase()}`];
+			const scopeAccountId = this.#getUsageReportScopeAccountId(report);
+			return scopeAccountId ? [`kiro:account:${scopeAccountId.toLowerCase()}`] : [];
 		}
 		const accountId = this.#getUsageReportMetadataValue(report, "accountId");
 		if (accountId) identifiers.push(`account:${accountId}`);
@@ -3139,6 +3193,7 @@ export class AuthStorage {
 		credential: OAuthCredential,
 		credentialId: number | undefined,
 		signal?: AbortSignal,
+		expectedCredential: OAuthCredential = credential,
 	): Promise<OAuthCredentials> {
 		if (credentialId !== undefined) {
 			const existing = this.#oauthCredentialRefreshInFlight.get(credentialId);
@@ -3154,11 +3209,15 @@ export class AuthStorage {
 				// Persist inside the shared operation, not in a caller's continuation.
 				// Every waiter may cancel, but a successful rotating-token response must
 				// still replace the stored refresh token before this promise settles.
-				const entries = this.#getStoredCredentials(provider);
-				const index = entries.findIndex(entry => entry.id === credentialId);
-				const current = index >= 0 ? entries[index]?.credential : undefined;
-				if (current?.type === "oauth") {
-					this.#replaceCredentialAt(provider, index, { ...current, ...refreshed, type: "oauth" });
+				const next: OAuthCredential = { ...credential, ...refreshed, type: "oauth" };
+				if (!this.#tryReplaceCredentialAtIfMatches(provider, credentialId, expectedCredential, next)) {
+					const latestRows = this.#store.listAuthCredentials(provider);
+					this.#setStoredCredentials(
+						provider,
+						latestRows.map(row => ({ id: row.id, credential: row.credential })),
+					);
+					const latest = latestRows.find(row => row.id === credentialId)?.credential;
+					if (latest?.type === "oauth") return latest;
 				}
 				return refreshed;
 			})
@@ -3667,31 +3726,42 @@ export class AuthStorage {
 			return false;
 		}
 
+		const providerKey = this.#getProviderTypeKey(provider, matched.type);
 		this.#clearSessionCredential(provider, sessionId);
-		this.#markCredentialBlocked(
-			this.#getProviderTypeKey(provider, matched.type),
-			matched.index,
-			Date.now() + AuthStorage.#defaultBackoffMs,
-		);
+		try {
+			const markSuspect = this.#store.markCredentialSuspect?.bind(this.#store);
+			if (markSuspect) {
+				await markSuspect(matched.id, { signal });
+			} else if (provider === "kiro" && matched.type === "oauth") {
+				// Kiro social access tokens can be invalidated by another client refresh
+				// hours before their local expiry timestamp. A 401/403 therefore needs a
+				// real refresh of the same pinned credential, not merely a snapshot reload.
+				await this.refreshCredentialById(matched.id, signal);
+			} else {
+				await this.reload();
+			}
 
-		const markSuspect = this.#store.markCredentialSuspect?.bind(this.#store);
-		if (markSuspect) {
-			await markSuspect(matched.id, { signal });
-		} else if (provider === "kiro" && matched.type === "oauth") {
-			// Kiro social access tokens can be invalidated by another client refresh
-			// hours before their local expiry timestamp. A 401/403 therefore needs a
-			// real refresh of the same pinned credential, not merely a snapshot reload.
-			await this.refreshCredentialById(matched.id, signal);
-		} else {
-			await this.reload();
+			const latestRows = this.#store.listAuthCredentials(provider);
+			this.#setStoredCredentials(
+				provider,
+				latestRows.map(row => ({ id: row.id, credential: row.credential })),
+			);
+			const latestIndex = latestRows.findIndex(row => row.id === matched.id);
+			const latest = latestIndex >= 0 ? latestRows[latestIndex]?.credential : undefined;
+			const recovered = latest ? !(await this.#credentialMatchesApiKey(latest, apiKey)) : false;
+			if (recovered && latest) {
+				this.#clearCredentialBlocked(providerKey, latestIndex);
+				this.#recordSessionCredential(provider, sessionId, latest.type, latestIndex);
+				return true;
+			}
+			this.#markCredentialBlocked(providerKey, matched.index, Date.now() + AuthStorage.#defaultBackoffMs);
+			return (
+				matched.type === "oauth" && latestRows.some(row => row.id !== matched.id && row.credential.type === "oauth")
+			);
+		} catch (error) {
+			this.#markCredentialBlocked(providerKey, matched.index, Date.now() + AuthStorage.#defaultBackoffMs);
+			throw error;
 		}
-
-		const latestRows = this.#store.listAuthCredentials(provider);
-		this.#setStoredCredentials(
-			provider,
-			latestRows.map(row => ({ id: row.id, credential: row.credential })),
-		);
-		return true;
 	}
 
 	// ─── Auth Broker integration ────────────────────────────────────────────
@@ -3800,6 +3870,7 @@ export class AuthStorage {
 			// in #refreshOAuthCredential doesn't suppress the requested refresh.
 			const stale: OAuthCredential = { ...target.credential, expires: 0 };
 			let refreshed: OAuthCredentials;
+			let persistedBySharedRefresh = false;
 			if (target.credential.mcpBinding) {
 				assertCanonicalMCPOAuthBinding(target.credential.mcpBinding);
 				const remoteRefresh = this.#store.refreshMCPOAuthCredential?.bind(this.#store);
@@ -3818,7 +3889,8 @@ export class AuthStorage {
 				}
 				refreshed = refreshedCredential;
 			} else {
-				refreshed = await this.#refreshOAuthCredential(provider as Provider, stale, id, signal);
+				refreshed = await this.#refreshOAuthCredential(provider as Provider, stale, id, signal, target.credential);
+				persistedBySharedRefresh = true;
 			}
 			const updated: OAuthCredential = {
 				type: "oauth",
@@ -3833,12 +3905,14 @@ export class AuthStorage {
 				kiroProfileArn: refreshed.kiroProfileArn ?? target.credential.kiroProfileArn,
 				mcpBinding: target.credential.mcpBinding,
 			};
-			this.#replaceCredentialAt(provider, index, updated);
+			if (!persistedBySharedRefresh) this.#replaceCredentialAt(provider, index, updated);
+			const persisted = this.#getStoredCredentials(provider).find(entry => entry.id === id)?.credential;
+			const result = persisted?.type === "oauth" ? persisted : updated;
 			return {
 				id,
 				provider,
-				credential: { ...updated, refresh: REMOTE_REFRESH_SENTINEL },
-				identityKey: resolveCredentialIdentityKey(provider, updated),
+				credential: { ...result, refresh: REMOTE_REFRESH_SENTINEL },
+				identityKey: resolveCredentialIdentityKey(provider, result),
 			};
 		}
 		throw new Error(`No credential with id=${id}`);
@@ -4128,6 +4202,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	#listDisabledByProviderStmt: Statement;
 	#insertStmt: Statement;
 	#updateStmt: Statement;
+	#updateIfMatchesStmt: Statement;
 	#deleteStmt: Statement;
 	#deleteIfMatchesStmt: Statement;
 	#deleteByProviderStmt: Statement;
@@ -4157,6 +4232,9 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		);
 		this.#updateStmt = this.#db.prepare(
 			`UPDATE auth_credentials SET credential_type = ?, data = ?, identity_key = ?, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ?`,
+		);
+		this.#updateIfMatchesStmt = this.#db.prepare(
+			`UPDATE auth_credentials SET credential_type = ?, data = ?, identity_key = ?, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ? AND data = ? AND disabled_cause IS NULL`,
 		);
 		this.#deleteStmt = this.#db.prepare(
 			`UPDATE auth_credentials SET disabled_cause = ?, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ?`,
@@ -4648,6 +4726,30 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			}
 		} catch {
 			// Ignore update failures
+		}
+	}
+
+	tryUpdateAuthCredentialIfMatches(
+		id: number,
+		expectedData: string,
+		credential: AuthCredential,
+		provider: string,
+	): boolean {
+		try {
+			const serialized = serializeCredential(provider, credential);
+			if (!serialized) return false;
+			const result = this.#updateIfMatchesStmt.run(
+				serialized.credentialType,
+				serialized.data,
+				serialized.identityKey,
+				id,
+				expectedData,
+			) as { changes: number };
+			if (result.changes !== 1) return false;
+			this.#purgeSupersededDisabledRows(provider, this.listAuthCredentials(provider));
+			return true;
+		} catch {
+			return false;
 		}
 	}
 

@@ -79,7 +79,7 @@ export const snapshotCredentialSchema = z.discriminatedUnion("type", [
 
 export const credentialSnapshotEntrySchema = z
 	.object({
-		id: z.number().int(),
+		id: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
 		provider: z.string().min(1),
 		credential: snapshotCredentialSchema,
 		identityKey: z.string().nullable(),
@@ -107,7 +107,16 @@ export const snapshotResponseSchema = z
 		generatedAt: z.number(),
 		serverNowMs: z.number(),
 		refresher: refresherScheduleSchema,
-		credentials: z.array(snapshotEntrySchema),
+		credentials: z.array(snapshotEntrySchema).superRefine((credentials, ctx) => {
+			const seen = new Set<number>();
+			for (let index = 0; index < credentials.length; index++) {
+				const id = credentials[index]!.id;
+				if (seen.has(id)) {
+					ctx.addIssue({ code: "custom", path: [index, "id"], message: `duplicate credential id: ${id}` });
+				}
+				seen.add(id);
+			}
+		}),
 	})
 	.strict();
 
@@ -138,7 +147,7 @@ export const snapshotStreamRemovedEventSchema = z
 		generation: z.number().int(),
 		serverNowMs: z.number(),
 		refresher: refresherScheduleSchema,
-		id: z.number().int(),
+		id: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
 	})
 	.strict();
 

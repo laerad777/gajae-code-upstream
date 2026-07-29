@@ -397,7 +397,7 @@ describe("AuthStorage OAuth refresh race", () => {
 
 	test("persists one successful shared refresh exactly once", async () => {
 		if (!authStorage || !store) throw new Error("test setup failed");
-		const update = vi.spyOn(store, "updateAuthCredential");
+		const compareAndSwap = vi.spyOn(store, "tryUpdateAuthCredentialIfMatches");
 		const refreshedExpires = Date.now() + 60 * 60_000;
 
 		oauthUtils.registerOAuthProvider({
@@ -427,8 +427,50 @@ describe("AuthStorage OAuth refresh race", () => {
 			"access-rotated",
 		);
 
-		expect(update).toHaveBeenCalledTimes(1);
+		expect(compareAndSwap).toHaveBeenCalledTimes(1);
+		const persisted = store.listAuthCredentials("unit-oauth-single-persist")[0]?.credential;
+		expect(persisted).toMatchObject({ access: "access-rotated", refresh: "refresh-rotated" });
 	});
+
+	test("does not overwrite a row changed while refresh is in flight", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const refreshStarted = Promise.withResolvers<void>();
+		const releaseRefresh = Promise.withResolvers<void>();
+		oauthUtils.registerOAuthProvider({
+			id: "unit-oauth-refresh-cas",
+			name: "Unit OAuth Refresh CAS",
+			sourceId: "auth-storage-oauth-refresh-race-test",
+			async login() {
+				return { access: "unused", refresh: "unused", expires: Date.now() + 60_000 };
+			},
+			async refreshToken(credentials) {
+				refreshStarted.resolve();
+				await releaseRefresh.promise;
+				return { ...credentials, access: "late-refresh-access", refresh: "late-refresh-token" };
+			},
+			getApiKey(credentials) {
+				return credentials.access;
+			},
+		});
+		await authStorage.set("unit-oauth-refresh-cas", [
+			{ type: "oauth", access: "old-access", refresh: "old-refresh", expires: Date.now() - 60_000 },
+		]);
+		const id = store.listAuthCredentials("unit-oauth-refresh-cas")[0]!.id;
+		const pending = authStorage.getApiKey("unit-oauth-refresh-cas", "refresh-cas");
+		await refreshStarted.promise;
+		store.updateAuthCredential(id, {
+			type: "oauth",
+			access: "new-login-access",
+			refresh: "new-login-token",
+			expires: Date.now() + 60 * 60_000,
+		});
+		releaseRefresh.resolve();
+
+		await expect(pending).resolves.toBe("new-login-access");
+		const persistedAfter = store.listAuthCredentials("unit-oauth-refresh-cas")[0]?.credential;
+		expect(persistedAfter).toMatchObject({ access: "new-login-access", refresh: "new-login-token" });
+	});
+
 	test("invalidating a session-sticky OAuth credential rotates the retry to another active credential", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 

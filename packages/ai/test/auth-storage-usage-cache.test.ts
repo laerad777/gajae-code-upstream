@@ -17,7 +17,7 @@ import {
 	AuthStorage,
 	type StoredAuthCredential,
 } from "../src/auth-storage";
-import type { UsageReport } from "../src/usage";
+import type { UsageProvider, UsageReport } from "../src/usage";
 import * as claudeUsage from "../src/usage/claude";
 
 function anthropicReports(reports: UsageReport[] | null): UsageReport[] {
@@ -342,6 +342,126 @@ describe("AuthStorage usage cache: jitter", () => {
 		} finally {
 			storage.close();
 			vi.restoreAllMocks();
+		}
+	});
+});
+
+describe("AuthStorage usage cache: duplicate opaque credentials", () => {
+	it("falls back to a valid same-refresh credential when its peer is stale", async () => {
+		const now = Date.now();
+		const rows: StoredAuthCredential[] = [
+			{
+				id: 24,
+				provider: "kiro",
+				credential: {
+					type: "oauth",
+					access: "stale-access",
+					refresh: "shared-refresh",
+					expires: now + 3_600_000,
+					kiroMethod: "google",
+					kiroProfileArn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/PROFILE123",
+				},
+				disabledCause: null,
+			},
+			{
+				id: 25,
+				provider: "kiro",
+				credential: {
+					type: "oauth",
+					access: "fresh-access",
+					refresh: "shared-refresh",
+					expires: now + 3_600_000,
+					kiroMethod: "google",
+					kiroProfileArn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/PROFILE123",
+				},
+				disabledCause: null,
+			},
+		];
+		const calls: string[] = [];
+		const provider: UsageProvider = {
+			id: "kiro",
+			supports: params => params.provider === "kiro" && params.credential.type === "oauth",
+			async fetchUsage(params) {
+				if (params.credential.type !== "oauth") return null;
+				calls.push(params.credential.accessToken ?? "missing");
+				if (params.credential.accessToken === "stale-access") return null;
+				return {
+					provider: "kiro",
+					fetchedAt: now,
+					limits: [],
+					metadata: { account: params.credential.accessToken, accountIdentity: "fresh-identity" },
+				};
+			},
+		};
+		const storage = new AuthStorage(makeStore(rows), {
+			usageProviderResolver: candidate => (candidate === "kiro" ? provider : undefined),
+		});
+		await storage.reload();
+		try {
+			const reports = await storage.fetchUsageReports();
+			expect(calls).toEqual(["stale-access", "fresh-access"]);
+			expect(reports?.map(report => report.metadata?.account)).toEqual(["fresh-access"]);
+		} finally {
+			storage.close();
+		}
+	});
+
+	it("preserves two Builder ID reports that share one display label", async () => {
+		const now = Date.now();
+		const rows: StoredAuthCredential[] = [
+			{
+				id: 31,
+				provider: "kiro",
+				credential: {
+					type: "oauth",
+					access: "builder-a",
+					refresh: "builder-refresh-a",
+					expires: now + 3_600_000,
+					kiroMethod: "builder-id",
+				},
+				disabledCause: null,
+			},
+			{
+				id: 32,
+				provider: "kiro",
+				credential: {
+					type: "oauth",
+					access: "builder-b",
+					refresh: "builder-refresh-b",
+					expires: now + 3_600_000,
+					kiroMethod: "builder-id",
+				},
+				disabledCause: null,
+			},
+		];
+		const provider: UsageProvider = {
+			id: "kiro",
+			async fetchUsage(params) {
+				const credentialId = params.credential.credentialId;
+				return {
+					provider: "kiro",
+					fetchedAt: now,
+					limits: [],
+					metadata: {
+						account: "kiro builder-id",
+						accountIdentity: `kiro-credential:${credentialId}`,
+					},
+				};
+			},
+		};
+		const storage = new AuthStorage(makeStore(rows), {
+			usageProviderResolver: candidate => (candidate === "kiro" ? provider : undefined),
+		});
+		await storage.reload();
+		try {
+			const reports = await storage.fetchUsageReports();
+			expect(reports).toHaveLength(2);
+			expect(reports?.map(report => report.metadata?.accountIdentity)).toEqual([
+				"kiro-credential:31",
+				"kiro-credential:32",
+			]);
+		} finally {
+			storage.close();
 		}
 	});
 });
