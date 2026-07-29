@@ -21,6 +21,9 @@ export const KIRO_STATIC_SEED: readonly Model<"kiro-streaming">[] = KIRO_STATIC_
 	id,
 	name: id,
 	...KIRO_STATIC_FIELDS,
+	kiro: id.startsWith("gpt-")
+		? { thinking: false, reasoning: true, outputConfig: false }
+		: { thinking: true, reasoning: false, outputConfig: true },
 }));
 
 export function kiroModelManagerOptions(config: { apiKey?: string }): ModelManagerOptions<"kiro-streaming"> {

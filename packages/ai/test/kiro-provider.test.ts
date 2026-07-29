@@ -589,19 +589,55 @@ describe("Kiro provider", () => {
 		expect(new Set(ids).size).toBe(ids.length);
 	});
 
-	test("maps profile effort to Kiro adaptive reasoning fields", () => {
+	test("maps Claude effort only to fields advertised by Kiro", () => {
 		const context = {
 			messages: [{ role: "user" as const, content: "Think", timestamp: 1 }],
 		};
-		const reasoningModel = { ...model, reasoning: true };
+		const reasoningModel: Model<"kiro-streaming"> = {
+			...model,
+			reasoning: true,
+			kiro: { thinking: true, reasoning: false, outputConfig: true },
+		};
 		expect(
 			buildKiroRequest(reasoningModel, context, BUILDER_ID_PROFILE_ARN, Effort.XHigh).additionalModelRequestFields,
 		).toEqual({
 			thinking: { type: "adaptive", display: "summarized" },
-			reasoning: { effort: "xhigh" },
+			output_config: { effort: "xhigh" },
 		});
 		expect(buildKiroRequest(reasoningModel, context, BUILDER_ID_PROFILE_ARN).additionalModelRequestFields).toEqual({
 			thinking: { type: "disabled" },
+		});
+	});
+
+	test("maps GPT effort only to the reasoning field advertised by Kiro", () => {
+		const context = {
+			messages: [{ role: "user" as const, content: "Think", timestamp: 1 }],
+		};
+		const reasoningModel: Model<"kiro-streaming"> = {
+			...model,
+			id: "gpt-5.6-sol",
+			name: "gpt-5.6-sol",
+			reasoning: true,
+			kiro: { thinking: false, reasoning: true, outputConfig: false },
+		};
+		expect(
+			buildKiroRequest(reasoningModel, context, BUILDER_ID_PROFILE_ARN, Effort.XHigh).additionalModelRequestFields,
+		).toEqual({
+			reasoning: { effort: "xhigh" },
+		});
+		expect(buildKiroRequest(reasoningModel, context, BUILDER_ID_PROFILE_ARN).additionalModelRequestFields).toEqual({
+			reasoning: { effort: "none" },
+		});
+		const legacyCachedModel: Model<"kiro-streaming"> = {
+			...model,
+			id: "gpt-5.6-terra",
+			name: "gpt-5.6-terra",
+			reasoning: true,
+		};
+		expect(
+			buildKiroRequest(legacyCachedModel, context, BUILDER_ID_PROFILE_ARN, Effort.High).additionalModelRequestFields,
+		).toEqual({
+			reasoning: { effort: "high" },
 		});
 	});
 
@@ -820,7 +856,7 @@ describe("Kiro provider", () => {
 		expect(freshCalls).toBe(1);
 	});
 
-	test("deduplicates discovered models and detects reasoning only from schema properties", async () => {
+	test("deduplicates discovered models and preserves advertised request fields", async () => {
 		const fetcher = async (): Promise<Response> =>
 			Response.json({
 				models: [
@@ -834,16 +870,39 @@ describe("Kiro provider", () => {
 					},
 					{ modelId: "plain", modelName: "duplicate" },
 					{
-						modelId: "reasoning",
-						additionalModelRequestFieldsSchema: { type: "object", properties: { thinking: { type: "object" } } },
+						modelId: "claude-reasoning",
+						additionalModelRequestFieldsSchema: {
+							type: "object",
+							properties: {
+								thinking: { type: "object" },
+								output_config: { type: "object" },
+							},
+						},
+					},
+					{
+						modelId: "gpt-reasoning",
+						additionalModelRequestFieldsSchema: {
+							type: "object",
+							properties: { reasoning: { type: "object" } },
+						},
 					},
 				],
 			});
 
 		const models = await fetchKiroModels({ accessToken: "token", profileArn: BUILDER_ID_PROFILE_ARN, fetcher });
-		expect(models?.map(discovered => discovered.id)).toEqual(["plain", "reasoning"]);
-		expect(models?.find(discovered => discovered.id === "plain")?.reasoning).toBe(false);
-		expect(models?.find(discovered => discovered.id === "reasoning")?.reasoning).toBe(true);
+		expect(models?.map(discovered => discovered.id)).toEqual(["plain", "claude-reasoning", "gpt-reasoning"]);
+		expect(models?.find(discovered => discovered.id === "plain")).toMatchObject({
+			reasoning: false,
+			kiro: { thinking: false, reasoning: false, outputConfig: false },
+		});
+		expect(models?.find(discovered => discovered.id === "claude-reasoning")).toMatchObject({
+			reasoning: true,
+			kiro: { thinking: true, reasoning: false, outputConfig: true },
+		});
+		expect(models?.find(discovered => discovered.id === "gpt-reasoning")).toMatchObject({
+			reasoning: true,
+			kiro: { thinking: false, reasoning: true, outputConfig: false },
+		});
 	});
 
 	test("returns null when profile resolution fails during discovery", async () => {

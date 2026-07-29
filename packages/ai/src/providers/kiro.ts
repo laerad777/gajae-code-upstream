@@ -283,7 +283,31 @@ export interface KiroRequest {
 	additionalModelRequestFields?: {
 		thinking?: { type: "adaptive" | "disabled"; display?: "summarized" | "omitted" };
 		reasoning?: { mode?: string; effort?: string };
+		output_config?: { effort: string };
 	};
+}
+type KiroAdditionalModelRequestFields = NonNullable<KiroRequest["additionalModelRequestFields"]>;
+
+function buildKiroReasoningFields(
+	model: Model<"kiro-streaming">,
+	effort?: KiroOptions["reasoning"],
+): KiroAdditionalModelRequestFields | undefined {
+	const capabilities =
+		model.kiro ??
+		(model.id.startsWith("gpt-5.6-")
+			? { thinking: false, reasoning: true, outputConfig: false }
+			: { thinking: true, reasoning: false, outputConfig: false });
+	const fields: KiroAdditionalModelRequestFields = {};
+	if (effort) {
+		if (capabilities.thinking) fields.thinking = { type: "adaptive", display: "summarized" };
+		if (capabilities.reasoning) fields.reasoning = { effort };
+		if (capabilities.outputConfig) fields.output_config = { effort };
+	} else if (capabilities.thinking) {
+		fields.thinking = { type: "disabled" };
+	} else if (capabilities.reasoning) {
+		fields.reasoning = { effort: "none" };
+	}
+	return fields.thinking || fields.reasoning || fields.output_config ? fields : undefined;
 }
 
 type KiroBlock = (TextContent | ToolCall) & { partialJson?: string };
@@ -476,14 +500,7 @@ export function buildKiroRequest(
 		},
 		profileArn,
 	};
-	if (model.reasoning) {
-		request.additionalModelRequestFields = reasoning
-			? {
-					thinking: { type: "adaptive", display: "summarized" },
-					reasoning: { effort: reasoning },
-				}
-			: { thinking: { type: "disabled" } };
-	}
+	if (model.reasoning) request.additionalModelRequestFields = buildKiroReasoningFields(model, reasoning);
 	return request;
 }
 

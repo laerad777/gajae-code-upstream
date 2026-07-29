@@ -964,6 +964,15 @@ export interface ModelRequestTransform {
 	/** Extra request body fields merged after provider defaults; protected core request keys are ignored. */
 	extraBody?: Record<string, unknown>;
 }
+/** Kiro model-specific request fields advertised by `ListAvailableModels`. */
+export interface KiroModelCapabilities {
+	/** Supports Anthropic-style `thinking` controls. */
+	thinking: boolean;
+	/** Supports GPT-style `reasoning` controls. */
+	reasoning: boolean;
+	/** Supports Anthropic-style `output_config.effort`. */
+	outputConfig: boolean;
+}
 
 export interface Model<TApi extends Api = any> {
 	id: string;
@@ -1020,6 +1029,8 @@ export interface Model<TApi extends Api = any> {
 	priority?: number;
 	/** Canonical thinking capability metadata for this model. */
 	thinking?: ThinkingConfig;
+	/** Kiro request-field capabilities preserved from dynamic model discovery. */
+	kiro?: TApi extends "kiro-streaming" ? KiroModelCapabilities : never;
 	/** Compatibility overrides per API. If not set, auto-detected from baseUrl. */
 	compat?: TApi extends "openai-completions" | "openai-responses"
 		? OpenAICompat

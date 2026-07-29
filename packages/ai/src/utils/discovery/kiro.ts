@@ -78,6 +78,7 @@ export async function fetchKiroModels(options: KiroDiscoveryOptions): Promise<Mo
 					: {};
 			const hasThinking = "thinking" in properties;
 			const hasReasoning = "reasoning" in properties;
+			const hasOutputConfig = "output_config" in properties;
 			// Kiro's `userInputMessage` wire format is text-only.
 			return [
 				{
@@ -87,6 +88,11 @@ export async function fetchKiroModels(options: KiroDiscoveryOptions): Promise<Mo
 					provider: "kiro" as const,
 					baseUrl: KIRO_RUNTIME_URL,
 					reasoning: (hasThinking || hasReasoning) as boolean,
+					kiro: {
+						thinking: hasThinking,
+						reasoning: hasReasoning,
+						outputConfig: hasOutputConfig,
+					},
 					input: ["text"],
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 					contextWindow: maxInput,

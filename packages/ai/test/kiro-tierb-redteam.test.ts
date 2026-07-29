@@ -364,6 +364,9 @@ describe("TB Defect 11 - seed metadata claims", () => {
 				id,
 				name: id,
 				...fields,
+				kiro: id.startsWith("gpt-")
+					? { thinking: false, reasoning: true, outputConfig: false }
+					: { thinking: true, reasoning: false, outputConfig: true },
 			})),
 		);
 	});
