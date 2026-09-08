@@ -3,9 +3,12 @@ import * as crypto from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { Process } from "@gajae-code/natives";
+import { type Process, verifyOwnerOnlyPathSecurity } from "@gajae-code/natives";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
-import { managedSecurityFailureClassification } from "../session/internal/managed-session-storage";
+import {
+	managedSecurityFailureClassification,
+	prepareManagedDirectoryRoot,
+} from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTime, readLinuxProcStartTimeSync } from "./linux-proc";
 import {
 	MANAGED_OWNER_COMMAND_ENV,
@@ -225,6 +228,8 @@ const FORCE_CLOSE_VERDICT_POLL_MS = 50;
 export interface CreateGjcTmuxSessionOptions {
 	platform?: NodeJS.Platform;
 	launch?: ManagedTmuxLaunchSpec;
+	/** @internal Select the actual CLI entrypoint in isolated managed-launch tests. */
+	supervisorArgvForTest?: readonly string[];
 }
 
 export type CreateOwnerIsolationTestDependencies = {
@@ -682,6 +687,14 @@ export function createGjcTmuxSession(
 		);
 	const stateDir = (platform === "win32" ? path.win32 : path).dirname(stateFile);
 	const generation = crypto.randomUUID();
+	if (launch) {
+		const lifecycleRoot = lifecyclePaths(stateDir, sessionId, generation).root;
+		if (fsSync.existsSync(lifecycleRoot) && !verifyOwnerOnlyPathSecurity(lifecycleRoot, "directory").ok)
+			throw new Error("gjc_tmux_managed_storage_unsafe");
+		prepareManagedDirectoryRoot(lifecycleRoot);
+		if (!verifyOwnerOnlyPathSecurity(lifecycleRoot, "directory").ok)
+			throw new Error("gjc_tmux_managed_storage_unsafe");
+	}
 	const authority = bindGjcTmuxProviderAuthority(provider, { stateDir, sessionId, generation });
 	const managedEnvironment: Record<string, string> = {
 		GJC_TMUX_LAUNCHED: "1",
@@ -701,10 +714,11 @@ export function createGjcTmuxSession(
 	const childEnvironment: Record<string, string> = { ...(launch?.env ?? {}), ...managedEnvironment };
 	const executionEnv = { ...env, ...managedEnvironment };
 	const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
+	const supervisorArgv = options.supervisorArgvForTest ?? managedOwnerSupervisorArgv();
 	const command =
 		platform === "win32"
 			? buildWindowsPowerShellInnerCommand({
-					command: launch ? managedOwnerSupervisorArgv() : ["gjc"],
+					command: launch ? [...supervisorArgv] : ["gjc"],
 					environment: {
 						...childEnvironment,
 						...(launch ? { [MANAGED_OWNER_COMMAND_ENV]: JSON.stringify(launch.argv) } : {}),
@@ -712,7 +726,7 @@ export function createGjcTmuxSession(
 				})
 			: (() => {
 					const supervisorEnvironment = launch ? { [MANAGED_OWNER_COMMAND_ENV]: JSON.stringify(launch.argv) } : {};
-					const invocation = launch ? managedOwnerSupervisorArgv() : ["gjc"];
+					const invocation = launch ? supervisorArgv : ["gjc"];
 					return `exec env ${Object.entries({ ...childEnvironment, ...supervisorEnvironment })
 						.map(([name, value]) => `${name}=${shellQuote(value)}`)
 						.join(" ")} ${invocation.map(shellQuote).join(" ")}`;

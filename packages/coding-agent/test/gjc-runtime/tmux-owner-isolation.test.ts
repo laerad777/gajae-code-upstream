@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -25,6 +26,7 @@ import {
 	planTmuxOwnerIsolationSync,
 	replaceOwnerGeneration,
 	replaceOwnerGenerationSync,
+	resolveManagedOwnerPredecessorSync,
 	TMUX_OWNER_ISOLATION_MAX_LINE_BYTES,
 	tmuxOwnerIsolationBootstrapArgv,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
@@ -40,6 +42,105 @@ const mainEntry = path.join(repoRoot, "packages", "coding-agent", "src", "main.t
 const ownerIsolationFlag = "--internal-tmux-owner-isolation";
 const invalidJsonLineResponse =
 	'{"schema_version":1,"ok":false,"code":"scope_unavailable","diagnostic":"invalid_json_line"}\n';
+
+describe("closed managed predecessor evidence", () => {
+	it.skipIf(process.platform !== "linux")(
+		"resolves only one exact recoverable schema-3 binding and schema-2 receipt",
+		async () => {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-predecessor-schema-"));
+			try {
+				const baseline = {
+					state: "current",
+					schema_version: 1,
+					generation: "generation",
+					session_id: "session",
+					published_at: "2026-09-08T00:00:00.000Z",
+				} as const;
+				const root = lifecyclePaths(stateDir, "session", "generation").root;
+				await fs.mkdir(root, { recursive: true, mode: 0o700 });
+				const command = ["gjc", "--resume"];
+				const binding = {
+					schema_version: 3,
+					binding_kind: "recoverable",
+					generation: "generation",
+					session_id: "session",
+					run_id: "run",
+					endpoint_incarnation: "incarnation",
+					child_token: "token",
+					command,
+					command_sha256: crypto.createHash("sha256").update(JSON.stringify(command)).digest("hex"),
+					supervisor_pid: 1,
+					supervisor_start_time: "123",
+					created_at: baseline.published_at,
+				};
+				const receipt = {
+					schema_version: 2,
+					generation: binding.generation,
+					session_id: binding.session_id,
+					run_id: binding.run_id,
+					endpoint_incarnation: binding.endpoint_incarnation,
+					child_token: binding.child_token,
+					command_sha256: binding.command_sha256,
+					supervisor_pid: binding.supervisor_pid,
+					supervisor_start_time: binding.supervisor_start_time,
+					child_pid: 2,
+					child_start_time: "124",
+					signal: "SIGABRT",
+					signal_number: 6,
+					exit_code: null,
+					received_at: baseline.published_at,
+				};
+				const write = async (name: string, value: object) =>
+					fs.writeFile(path.join(root, name), `${JSON.stringify(value)}\n`, { mode: 0o600 });
+				await write("child-token.binding.json", binding);
+				await write("sigabrt-token.receipt.json", receipt);
+				const resolve = () => resolveManagedOwnerPredecessorSync(stateDir, "session", baseline);
+				expect(resolve()).toEqual({
+					generation: "generation",
+					sessionId: "session",
+					runId: "run",
+					incarnation: "incarnation",
+					predecessorToken: "token",
+				});
+				for (const patch of [
+					{ schema_version: 2 },
+					{ binding_kind: "opaque", command: undefined, command_sha256: undefined },
+					{ binding_kind: "opaque" },
+					{ extra: true },
+					{ generation: "stale" },
+					{ session_id: "other" },
+					{ run_id: "other" },
+					{ endpoint_incarnation: "other" },
+					{ command: ["other"] },
+					{ supervisor_pid: 0 },
+					{ created_at: "invalid" },
+				]) {
+					await write("child-token.binding.json", { ...binding, ...patch });
+					expect(resolve).toThrow("managed_owner_replacement_evidence_untrusted");
+				}
+				await write("child-token.binding.json", binding);
+				for (const patch of [
+					{ child_token: "other" },
+					{ child_start_time: "" },
+					{ supervisor_start_time: "other" },
+					{ signal: "EXIT", exit_code: 134 },
+					{ extra: true },
+				]) {
+					await write("sigabrt-token.receipt.json", { ...receipt, ...patch });
+					expect(resolve).toThrow("managed_owner_replacement_evidence_untrusted");
+				}
+				await write("sigabrt-token.receipt.json", receipt);
+				// Unpaired bindings remain discovery-only; a second paired candidate is ambiguous.
+				await write("child-second.binding.json", { ...binding, child_token: "second" });
+				expect(resolve()?.predecessorToken).toBe("token");
+				await write("sigabrt-second.receipt.json", { ...receipt, child_token: "second" });
+				expect(resolve).toThrow("managed_owner_replacement_evidence_ambiguous");
+			} finally {
+				await fs.rm(stateDir, { recursive: true, force: true });
+			}
+		},
+	);
+});
 
 it("accepts only the exact scoped bootstrap success receipt", () => {
 	expect(
